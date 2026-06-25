@@ -144,6 +144,29 @@ export const VAULT_PALETTE = [
   '#14b8a6', // teal
 ] as const;
 
+// Per-brain colours, keyed by a brain key (vault id or sub-brain folder path),
+// persisted in localStorage so each (sub-)brain can have its own colour.
+const BRAIN_COLOR_STORE = 'brain-colors';
+export function getStoredBrainColors(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  try {
+    return JSON.parse(window.localStorage.getItem(BRAIN_COLOR_STORE) || '{}') as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+export function setStoredBrainColor(key: string, color: string | undefined): void {
+  if (typeof window === 'undefined') return;
+  const map = getStoredBrainColors();
+  if (color) map[key] = color;
+  else delete map[key];
+  try {
+    window.localStorage.setItem(BRAIN_COLOR_STORE, JSON.stringify(map));
+  } catch {
+    /* ignore quota errors */
+  }
+}
+
 export function getVaultColor(vault: WikiVault): string {
   if (vault.color) return vault.color;
   // deterministic hash fallback so colour is stable across reloads
@@ -1657,6 +1680,23 @@ tags: [brain, sub-brain]
   const writable = await handle.createWritable();
   await writable.write(content);
   await writable.close();
+
+  // Standard sub-brain scaffold: a log + the conventional content folders, each with
+  // a .gitkeep so the empty folders persist.
+  const logHandle = await dir.getFileHandle('log.md', { create: true });
+  const logW = await logHandle.createWritable();
+  await logW.write(
+    `# ${title} Brain — Log\n\nAppend-only. Newest entries at the bottom.\n\n### [${today}] setup | ${title} sub-brain created\n- Summary: scaffolded ${folderName} (anchor + standard folders).\n`,
+  );
+  await logW.close();
+
+  for (const sub of ['concepts', 'entities', 'sources', 'syntheses', 'projects']) {
+    const subDir = await dir.getDirectoryHandle(sub, { create: true });
+    const keep = await subDir.getFileHandle('.gitkeep', { create: true });
+    const kw = await keep.createWritable();
+    await kw.write('');
+    await kw.close();
+  }
   return { folderName, anchorFile };
 }
 

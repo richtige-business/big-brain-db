@@ -1903,3 +1903,37 @@ input.propValue:focus {
 .treeRow.folderRow.brainFolderRow .folderMain svg {
   color: var(--brain-color, var(--accent));
 }
+
+/* Inline per-brain colour swatches (revealed with folderActions on hover) */
+.brainColorSwatches {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.brainColorSwatches .colorSwatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  padding: 0;
+  cursor: pointer;
+}
+.brainColorSwatches .colorSwatch.active {
+  outline: 2px solid var(--brain-color, #0f172a);
+  outline-offset: 1px;
+}
+.brainColorSwatches .colorSwatchReset {
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 4px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--muted, #64748b);
+}
+
+/* Fix: keep brain names readable — do NOT tint the label text with the brain colour
+   (only the icon/border use it). Overrides the earlier brainFolderRow text rule. */
+.treeRow.folderRow.brainFolderRow .folderMain span {
+  color: var(--text, #0f172a);
+}

@@ -76,6 +76,8 @@ import {
   fileTitle,
   getCollaborationState,
   getVaultColor,
+  getStoredBrainColors,
+  setStoredBrainColor,
   getActorBrainRole,
   getWikiVaultHandles,
   hasVaultPermission,
@@ -236,7 +238,7 @@ function FolderNode({
           >
             <Brain size={13} />
           </button>
-          {isVaultRoot && (
+          {(isVaultRoot || asBrain) && (
             <div className="colorPickerWrapper">
               <button
                 type="button"
@@ -252,10 +254,7 @@ function FolderNode({
                 <Palette size={13} />
               </button>
               {colorPickerOpen && (
-                <div
-                  className="colorSwatchMenu"
-                  onClick={(e) => e.stopPropagation()}
-                >
+                <div className="colorSwatchMenu" onClick={(e) => e.stopPropagation()}>
                   {VAULT_PALETTE.map((swatch) => (
                     <button
                       key={swatch}
@@ -1616,16 +1615,21 @@ function AddBrainDialog({
   onClose,
   onCreate,
   onJoinCode,
+  brainTargets,
+  onCreateSubBrainUnder,
 }: {
   onClose: () => void;
   onCreate: () => void;
   onJoinCode: (code: string, actorName: string, handle: FileSystemDirectoryHandle) => boolean | Promise<boolean>;
+  brainTargets: { key: string; label: string; folder: WikiFolder }[];
+  onCreateSubBrainUnder: (folder: WikiFolder) => void;
 }) {
   const [code, setCode] = useState('');
   const [actorName, setActorName] = useState('');
   const [joinError, setJoinError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
   const joinPickerBusyRef = useRef(false);
+  const [subBrainTargetKey, setSubBrainTargetKey] = useState('');
 
   return (
     <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
@@ -1708,6 +1712,38 @@ function AddBrainDialog({
               Choose folder
             </button>
           </div>
+
+          {brainTargets.length > 0 && (
+            <div className="addBrainCard">
+              <strong>Sub-Brain</strong>
+              <span>Create a sub-brain under an existing brain.</span>
+              <select
+                value={subBrainTargetKey}
+                onChange={(event) => setSubBrainTargetKey(event.target.value)}
+              >
+                <option value="">Choose a parent brain…</option>
+                {brainTargets.map((t) => (
+                  <option key={t.key} value={t.key}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                className="primary"
+                type="button"
+                disabled={!subBrainTargetKey}
+                onClick={() => {
+                  const target = brainTargets.find((t) => t.key === subBrainTargetKey);
+                  if (!target) return;
+                  onCreateSubBrainUnder(target.folder);
+                  onClose();
+                }}
+              >
+                <Brain size={16} />
+                Create sub-brain
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -2021,6 +2057,8 @@ function WikiSidebar({
   onCreateFolderInFolder,
   onCreateSubBrainInFolder,
   onSetVaultColor,
+  onSetBrainColor,
+  colorTick,
   onDeleteVault,
   canDeleteVault,
 }: {
@@ -2039,9 +2077,14 @@ function WikiSidebar({
   onCreateFolderInFolder: (folder: WikiFolder) => void;
   onCreateSubBrainInFolder: (folder: WikiFolder) => void;
   onSetVaultColor: (vaultId: string, color: string | undefined) => void;
+  onSetBrainColor: (key: string, color: string | undefined) => void;
+  colorTick: number;
   onDeleteVault: (vaultId: string) => void;
   canDeleteVault: (vaultId: string) => boolean;
 }) {
+  // Re-read per-brain colours each render; colorTick changes force a refresh.
+  void colorTick;
+  const storedBrainColors = getStoredBrainColors();
   const [brainFilesOpen, setBrainFilesOpen] = useState(false);
 
   const allFiles = useMemo(() => vaults.flatMap((v) => v.flatFiles), [vaults]);
@@ -2147,11 +2190,12 @@ function WikiSidebar({
             ? collaboratorsForVault(section.vaultId, memberships, actors)
             : [];
           const useInitials = collaborators.length > 5;
+          const color = storedBrainColors[section.key] ?? section.color;
           return (
             <section
               className={`wikiSection ${activeVaultId === section.vaultId ? 'active' : ''}`}
               key={section.key}
-              style={{ '--brain-color': section.color } as React.CSSProperties}
+              style={{ '--brain-color': color } as React.CSSProperties}
               onMouseEnter={() =>
                 section.isVault
                   ? onHoverScope({ type: 'vault', vaultId: section.vaultId })
@@ -2164,7 +2208,7 @@ function WikiSidebar({
                 depth={0}
                 asBrain={!section.isVault}
                 isVaultRoot={section.isVault}
-                vaultColor={section.color}
+                vaultColor={color}
                 lintMap={lintMap}
                 onFolderCluster={onFolderCluster}
                 onHoverScope={onHoverScope}
@@ -2172,7 +2216,10 @@ function WikiSidebar({
                 onCreateMarkdownInFolder={onCreateMarkdownInFolder}
                 onCreateFolderInFolder={onCreateFolderInFolder}
                 onCreateSubBrainInFolder={onCreateSubBrainInFolder}
-                onSetVaultColor={(c) => onSetVaultColor(section.vaultId, c)}
+                onSetVaultColor={(c) => {
+                  onSetBrainColor(section.key, c);
+                  if (section.isVault) onSetVaultColor(section.vaultId, c);
+                }}
                 onDeleteBrain={section.isVault ? () => onDeleteVault(section.vaultId) : undefined}
                 canDeleteBrain={section.isVault ? canDeleteVault(section.vaultId) : false}
               />
@@ -2826,6 +2873,12 @@ export default function Home() {
     [currentActor.id, memberships, selectFile, setActiveVault, setEditorMode, updateVault, vaults],
   );
 
+  const [brainColorTick, setBrainColorTick] = useState(0);
+  const handleSetBrainColor = useCallback((key: string, color: string | undefined) => {
+    setStoredBrainColor(key, color);
+    setBrainColorTick((t) => t + 1);
+  }, []);
+
   const handleSetVaultColor = useCallback(
     async (vaultId: string, color: string | undefined) => {
       setVaultColor(vaultId, color);
@@ -3064,6 +3117,13 @@ export default function Home() {
           onClose={() => setAddBrainDialogOpen(false)}
           onCreate={openVault}
           onJoinCode={joinBrainByCode}
+          brainTargets={vaults.flatMap((v) => [
+            { key: v.id, label: v.name, folder: v.tree },
+            ...collectBrainAnchorFolders(v.tree)
+              .filter((f) => f.path !== v.tree.path)
+              .map((f) => ({ key: f.id, label: `↳ ${f.name}`, folder: f })),
+          ])}
+          onCreateSubBrainUnder={createSubBrainInFolder}
         />
       )}
 
@@ -3087,6 +3147,8 @@ export default function Home() {
               onCreateMarkdownInFolder={createMarkdownInFolder}
               onCreateFolderInFolder={createSubfolder}
               onCreateSubBrainInFolder={createSubBrainInFolder}
+              colorTick={brainColorTick}
+              onSetBrainColor={handleSetBrainColor}
               onSetVaultColor={handleSetVaultColor}
               onDeleteVault={handleDeleteVault}
               canDeleteVault={canDeleteVault}
