@@ -862,13 +862,77 @@ export function isBrainMetaFile(file: WikiFile): boolean {
   );
 }
 
+// A folder is a "sub-brain" when it directly contains a `*-brain.md` anchor file
+// (nested below the vault root). This lets one picked vault render a Big Brain with
+// nested Sub-Brain nodes (e.g. la-chaine → vision-brain, products-brain → medigen-brain),
+// instead of one flat vault. Root-level config (AGENTS.md, templates/, queries/) has no
+// enclosing sub-brain folder, so it attaches to the vault's Big Brain node.
+const folderOfPath = (p: string): string => {
+  const parts = p.split('/').filter(Boolean);
+  parts.pop();
+  return parts.join('/');
+};
+const ancestorFolders = (folder: string): string[] => {
+  const parts = folder.split('/').filter(Boolean);
+  const out: string[] = [];
+  for (let i = parts.length; i >= 1; i -= 1) out.push(parts.slice(0, i).join('/'));
+  return out; // deepest first, includes `folder` itself
+};
+const subBrainNodeIdForFolder = (folder: string): string => `subbrain:${folder}`;
+const prettySubBrainTitle = (folder: string): string => {
+  const seg = folder.split('/').filter(Boolean).pop() || folder;
+  const base = seg.replace(/-brain$/i, '').replace(/[-_]+/g, ' ').trim();
+  const cap = base.charAt(0).toUpperCase() + base.slice(1);
+  return /brain$/i.test(seg) ? `${cap} Brain` : `${cap} Brain`;
+};
+
 export function buildGraph(files: WikiFile[]): { nodes: GraphNode[]; edges: GraphEdge[] } {
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
-  const visibleFiles = files.filter((file) => !isBrainMetaFile(file));
   const linkIndex = buildLinkIndex(files);
   const vaultsById = new Map<string, string>();
   for (const file of files) vaultsById.set(file.vaultId, file.vaultName);
+
+  // Detect nested sub-brain folders + the vault each belongs to.
+  const brainFolders = new Set<string>();
+  const folderVaultId = new Map<string, string>();
+  for (const file of files) {
+    const parts = file.path.split('/').filter(Boolean);
+    if (parts.length >= 3 && file.name.toLowerCase().endsWith('-brain.md')) {
+      brainFolders.add(parts.slice(0, -1).join('/'));
+    }
+  }
+  for (const file of files) {
+    const f = folderOfPath(file.path);
+    for (const anc of ancestorFolders(f)) {
+      if (brainFolders.has(anc) && !folderVaultId.has(anc)) folderVaultId.set(anc, file.vaultId);
+    }
+  }
+  // A nested anchor / log / index directly inside a sub-brain folder is that
+  // sub-brain's meta (folded into the node), not a separate file node.
+  const isSubBrainMeta = (file: WikiFile): boolean => {
+    const parent = folderOfPath(file.path);
+    if (!brainFolders.has(parent)) return false;
+    const n = file.name.toLowerCase();
+    return n.endsWith('-brain.md') || n === 'log.md' || n === 'index.md' || n === 'agent_start.md';
+  };
+  // The brain node a file belongs to: deepest ancestor sub-brain folder, else the vault.
+  const ownerNodeForFile = (file: WikiFile): string => {
+    const f = folderOfPath(file.path);
+    for (const anc of ancestorFolders(f)) {
+      if (brainFolders.has(anc)) return subBrainNodeIdForFolder(anc);
+    }
+    return vaultBrainNodeId(file.vaultId);
+  };
+  const parentNodeForBrainFolder = (folder: string): string => {
+    const ancestors = ancestorFolders(folder).slice(1); // skip self
+    for (const anc of ancestors) {
+      if (brainFolders.has(anc)) return subBrainNodeIdForFolder(anc);
+    }
+    return vaultBrainNodeId(folderVaultId.get(folder) || '');
+  };
+
+  const visibleFiles = files.filter((file) => !isBrainMetaFile(file) && !isSubBrainMeta(file));
 
   nodes.set(BRAIN_NODE_ID, {
     id: BRAIN_NODE_ID,
@@ -891,6 +955,19 @@ export function buildGraph(files: WikiFile[]): { nodes: GraphNode[]; edges: Grap
     });
   }
 
+  for (const folder of brainFolders) {
+    const vaultId = folderVaultId.get(folder) || '';
+    nodes.set(subBrainNodeIdForFolder(folder), {
+      id: subBrainNodeIdForFolder(folder),
+      title: prettySubBrainTitle(folder),
+      path: `brain://${folder}`,
+      weight: 1,
+      vaultId,
+      vaultName: vaultsById.get(vaultId) || folder,
+      subBrain: true,
+    });
+  }
+
   for (const file of visibleFiles) {
     nodes.set(file.id, {
       id: file.id,
@@ -909,12 +986,15 @@ export function buildGraph(files: WikiFile[]): { nodes: GraphNode[]; edges: Grap
       const key = resolved
         ? isBrainMetaFile(resolved)
           ? vaultBrainNodeId(resolved.vaultId)
-          : resolved.id
+          : isSubBrainMeta(resolved)
+            ? subBrainNodeIdForFolder(folderOfPath(resolved.path))
+            : resolved.id
         : `unresolved:${target}`;
       if (seen.has(key) || key === file.id) continue;
       seen.add(key);
 
       if (resolved) {
+        if (!nodes.has(key)) continue;
         edges.push({ id: `${file.id}-${key}`, source: file.id, target: key });
         nodes.get(file.id)!.weight += 1;
         nodes.get(key)!.weight += 1;
@@ -941,6 +1021,7 @@ export function buildGraph(files: WikiFile[]): { nodes: GraphNode[]; edges: Grap
   const pushBrainMapEdge = (source: string, target: string, brainAnchor = false) => {
     const edgeKey = `${source}->${target}`;
     if (source === target || edgeKeys.has(edgeKey)) return;
+    if (!nodes.has(source) || !nodes.has(target)) return;
     edgeKeys.add(edgeKey);
     edges.push({
       id: `brain-map:${source}-${target}`,
@@ -953,13 +1034,18 @@ export function buildGraph(files: WikiFile[]): { nodes: GraphNode[]; edges: Grap
     nodes.get(target)!.weight += 0.35;
   };
 
+  // Big Brain root -> each vault.
   for (const [vaultId] of vaultsById) {
-    const subBrainNodeId = vaultBrainNodeId(vaultId);
-    pushBrainMapEdge(BRAIN_NODE_ID, subBrainNodeId);
-
-    for (const file of visibleFiles.filter((candidate) => candidate.vaultId === vaultId)) {
-      pushBrainMapEdge(subBrainNodeId, file.id, true);
-    }
+    pushBrainMapEdge(BRAIN_NODE_ID, vaultBrainNodeId(vaultId));
+  }
+  // Parent brain -> nested sub-brain (recursive nesting).
+  for (const folder of brainFolders) {
+    pushBrainMapEdge(parentNodeForBrainFolder(folder), subBrainNodeIdForFolder(folder));
+  }
+  // Each file -> its owning brain node (nested sub-brain, else the vault Big Brain;
+  // so root-level config attaches to the vault's Big Brain node).
+  for (const file of visibleFiles) {
+    pushBrainMapEdge(ownerNodeForFile(file), file.id, true);
   }
 
   return { nodes: Array.from(nodes.values()), edges };
