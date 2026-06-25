@@ -70,6 +70,7 @@ import {
   computeWikiFileContentHash,
   createMarkdownFileInDirectory,
   createSubfolderInDirectory,
+  createSubBrainInDirectory,
   createVaultId,
   extractLinks,
   fileTitle,
@@ -132,6 +133,7 @@ function FolderNode({
   onClearHover,
   onCreateMarkdownInFolder,
   onCreateFolderInFolder,
+  onCreateSubBrainInFolder,
   onSetVaultColor,
   onDeleteBrain,
   canDeleteBrain,
@@ -147,6 +149,7 @@ function FolderNode({
   onClearHover: () => void;
   onCreateMarkdownInFolder: (folder: WikiFolder) => void;
   onCreateFolderInFolder: (folder: WikiFolder) => void;
+  onCreateSubBrainInFolder: (folder: WikiFolder) => void;
   onSetVaultColor: (color: string | undefined) => void;
   onDeleteBrain?: () => void;
   canDeleteBrain?: boolean;
@@ -220,6 +223,18 @@ function FolderNode({
             }}
           >
             <FolderPlus size={13} />
+          </button>
+          <button
+            type="button"
+            className="folderActionIcon"
+            title="New Sub-Brain"
+            aria-label="New Sub-Brain"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCreateSubBrainInFolder(folder);
+            }}
+          >
+            <Brain size={13} />
           </button>
           {isVaultRoot && (
             <div className="colorPickerWrapper">
@@ -300,6 +315,7 @@ function FolderNode({
               onClearHover={onClearHover}
               onCreateMarkdownInFolder={onCreateMarkdownInFolder}
               onCreateFolderInFolder={onCreateFolderInFolder}
+              onCreateSubBrainInFolder={onCreateSubBrainInFolder}
               onSetVaultColor={onSetVaultColor}
             />
           ))}
@@ -445,29 +461,51 @@ function computeLayout(rawNodes: GraphNode[], rawEdges: GraphEdge[]): {
   >;
   edges: GraphEdge[];
 } {
-  const vaultIds = Array.from(new Set(rawNodes.map((node) => node.vaultId).filter(Boolean))) as string[];
-  const clusterCenters = computeClusterCenters(vaultIds);
-  const relationCenters = computeRelationCenters(rawNodes, rawEdges, clusterCenters);
+  // Radial layout: the Big Brain sits at the centre (0,0); every sub-brain node is
+  // anchored on a ring around it; files cluster around their owning sub-brain. (The
+  // vault node, if any, sits with the Big Brain at the centre.)
+  const subBrainNodes = rawNodes.filter((n) => n.subBrain && n.id.startsWith('subbrain:'));
+  const RING = Math.max(560, subBrainNodes.length * 150);
+  const subBrainCenters = new Map<string, { x: number; y: number }>();
+  subBrainNodes.forEach((n, i) => {
+    const angle = (i / Math.max(subBrainNodes.length, 1)) * Math.PI * 2 - Math.PI / 2;
+    subBrainCenters.set(n.id, { x: Math.cos(angle) * RING, y: Math.sin(angle) * RING });
+  });
+  const ownerOf = new Map<string, string>();
+  for (const e of rawEdges) if (e.brainAnchor) ownerOf.set(e.target, e.source);
+  const targetCenter = (n: SimNode): { x: number; y: number } => {
+    if (n.brain) return { x: 0, y: 0 };
+    if (n.id.startsWith('subbrain:')) return subBrainCenters.get(n.id) ?? { x: 0, y: 0 };
+    if (n.subBrain) return { x: 0, y: 0 }; // vault node sits with the Big Brain
+    const owner = ownerOf.get(n.id);
+    if (owner && subBrainCenters.has(owner)) return subBrainCenters.get(owner)!;
+    return { x: 0, y: 0 };
+  };
+
   const simNodes: SimNode[] = rawNodes.map((n) => ({
     id: n.id,
     title: n.title,
     weight: n.weight,
     unresolved: n.unresolved,
     vaultId: n.vaultId,
-    communityId: relationCenters.get(n.id)?.communityId,
     brain: n.brain,
     subBrain: n.subBrain,
   }));
 
   for (const node of simNodes) {
     if (node.brain) {
+      // Big Brain at the centre.
       node.fx = 0;
       node.fy = 0;
-    } else if (node.subBrain) {
-      const center = clusterCenters.get(node.vaultId || '');
-      if (center) {
-        node.fx = center.x;
-        node.fy = center.y;
+    } else if (node.subBrain && !node.id.startsWith('subbrain:')) {
+      // The vault node (the "la chaine" big brain) sits at the exact same centre.
+      node.fx = 0;
+      node.fy = 0;
+    } else if (node.id.startsWith('subbrain:')) {
+      const c = subBrainCenters.get(node.id);
+      if (c) {
+        node.fx = c.x;
+        node.fy = c.y;
       }
     }
   }
@@ -492,18 +530,16 @@ function computeLayout(rawNodes: GraphNode[], rawEdges: GraphEdge[]): {
     .force('center', forceCenter(0, 0))
     .force(
       'clusterX',
-      forceX<SimNode>((d) => (d.brain ? 0 : clusterCenters.get(d.vaultId || '')?.x ?? 0)).strength((d) =>
-        d.brain ? 0 : d.subBrain ? 1 : 0.42,
+      forceX<SimNode>((d) => targetCenter(d).x).strength((d) =>
+        d.brain || d.id.startsWith('subbrain:') ? 0 : d.subBrain ? 0.7 : 0.5,
       ),
     )
     .force(
       'clusterY',
-      forceY<SimNode>((d) => (d.brain ? 0 : clusterCenters.get(d.vaultId || '')?.y ?? 0)).strength((d) =>
-        d.brain ? 0 : d.subBrain ? 1 : 0.42,
+      forceY<SimNode>((d) => targetCenter(d).y).strength((d) =>
+        d.brain || d.id.startsWith('subbrain:') ? 0 : d.subBrain ? 0.7 : 0.5,
       ),
     )
-    .force('relationX', forceX<SimNode>((d) => (d.brain || d.subBrain ? 0 : relationCenters.get(d.id)?.x ?? 0)).strength(0.03))
-    .force('relationY', forceY<SimNode>((d) => (d.brain || d.subBrain ? 0 : relationCenters.get(d.id)?.y ?? 0)).strength(0.03))
     .force(
       'collide',
       // Hitbox radius: half the rendered NODE_HITBOX plus a gap, scaled a little by
@@ -1983,6 +2019,7 @@ function WikiSidebar({
   onClearHover,
   onCreateMarkdownInFolder,
   onCreateFolderInFolder,
+  onCreateSubBrainInFolder,
   onSetVaultColor,
   onDeleteVault,
   canDeleteVault,
@@ -2000,6 +2037,7 @@ function WikiSidebar({
   onClearHover: () => void;
   onCreateMarkdownInFolder: (folder: WikiFolder) => void;
   onCreateFolderInFolder: (folder: WikiFolder) => void;
+  onCreateSubBrainInFolder: (folder: WikiFolder) => void;
   onSetVaultColor: (vaultId: string, color: string | undefined) => void;
   onDeleteVault: (vaultId: string) => void;
   canDeleteVault: (vaultId: string) => boolean;
@@ -2133,6 +2171,7 @@ function WikiSidebar({
                 onClearHover={onClearHover}
                 onCreateMarkdownInFolder={onCreateMarkdownInFolder}
                 onCreateFolderInFolder={onCreateFolderInFolder}
+                onCreateSubBrainInFolder={onCreateSubBrainInFolder}
                 onSetVaultColor={(c) => onSetVaultColor(section.vaultId, c)}
                 onDeleteBrain={section.isVault ? () => onDeleteVault(section.vaultId) : undefined}
                 canDeleteBrain={section.isVault ? canDeleteVault(section.vaultId) : false}
@@ -2746,6 +2785,47 @@ export default function Home() {
     [currentActor.id, memberships, updateVault, vaults],
   );
 
+  const createSubBrainInFolder = useCallback(
+    async (folder: WikiFolder) => {
+      const role = getActorBrainRole(memberships, folder.vaultId, currentActor.id);
+      if (!roleCanEdit(role)) {
+        setError('You do not have permission to create sub-brains in this Brain.');
+        return;
+      }
+      if (!folder.handle) {
+        setError('The selected folder cannot be written to.');
+        return;
+      }
+      const vault = vaults.find((entry) => entry.id === folder.vaultId);
+      if (!vault) return;
+
+      const name = window.prompt('Name of the new Sub-Brain', 'New');
+      if (!name) return;
+      try {
+        if (!(await hasVaultPermission(folder.handle, true))) {
+          setError('Write access to the folder was not granted.');
+          return;
+        }
+        const { folderName, anchorFile } = await createSubBrainInDirectory(folder.handle, name);
+        const { vault: refreshedVault } = await loadVault(vault.rootHandle, vault.id, vault.name);
+        updateVault(refreshedVault);
+        const targetPath = `${folder.path}/${folderName}/${anchorFile}`;
+        const createdAnchor = refreshedVault.flatFiles.find((file) => file.path === targetPath);
+        if (createdAnchor) {
+          selectFile(createdAnchor.id);
+          setActiveVault(vault.id);
+          setGraphReturnFileId(null);
+          setEditorMode('edit');
+        }
+        await saveWikiVaultHandles(useWikiStore.getState().vaults);
+        setError(null);
+      } catch (err) {
+        setError((err as Error).message || 'Sub-Brain could not be created.');
+      }
+    },
+    [currentActor.id, memberships, selectFile, setActiveVault, setEditorMode, updateVault, vaults],
+  );
+
   const handleSetVaultColor = useCallback(
     async (vaultId: string, color: string | undefined) => {
       setVaultColor(vaultId, color);
@@ -3006,6 +3086,7 @@ export default function Home() {
               onClearHover={clearHoverScope}
               onCreateMarkdownInFolder={createMarkdownInFolder}
               onCreateFolderInFolder={createSubfolder}
+              onCreateSubBrainInFolder={createSubBrainInFolder}
               onSetVaultColor={handleSetVaultColor}
               onDeleteVault={handleDeleteVault}
               canDeleteVault={canDeleteVault}

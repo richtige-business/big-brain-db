@@ -1612,6 +1612,54 @@ export async function createSubfolderInDirectory(
   return folderName;
 }
 
+// Create a nested Sub-Brain: a `<name>-brain/` folder containing its own
+// name-matching anchor `<name>-brain.md` (with a Role-In-The-Big-Brain stub). Used
+// to create sub-brains of sub-brains from the sidebar.
+export async function createSubBrainInDirectory(
+  parentDir: FileSystemDirectoryHandle,
+  rawName: string,
+): Promise<{ folderName: string; anchorFile: string }> {
+  const base = sanitizeFsName((rawName || '').trim() || 'New', 'New').replace(/\.md$/i, '');
+  const slug = base.toLowerCase().endsWith('-brain') ? base : `${base}-brain`;
+  const folderName = await nextAvailableDirectoryName(parentDir, slug);
+  const dir = await parentDir.getDirectoryHandle(folderName, { create: true });
+  const anchorFile = `${folderName}.md`;
+  const title = folderName
+    .replace(/-brain$/i, '')
+    .replace(/[-_]+/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .trim();
+  const today = new Date().toISOString().slice(0, 10);
+  const content = `---
+type: brain
+status: active
+priority: now
+created: ${today}
+last_updated: ${today}
+created_by: user:local
+updated_by: user:local
+tags: [brain, sub-brain]
+---
+
+# ${title} Brain
+
+## Role In The Big Brain
+
+- **Owns:**
+- **Does not own:**
+- **Connects to:** [[../${parentDir.name}]]
+- **Entry point:** this file is the anchor + local map for ${title}.
+
+## Navigation Map
+
+`;
+  const handle = await dir.getFileHandle(anchorFile, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(content);
+  await writable.close();
+  return { folderName, anchorFile };
+}
+
 export async function createMarkdownFileInVault(
   vault: WikiVault,
   rawTitle: string,
