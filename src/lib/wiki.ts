@@ -1044,6 +1044,12 @@ export function buildGraph(files: WikiFile[]): { nodes: GraphNode[]; edges: Grap
         nodes.get(file.id)!.weight += 1;
         nodes.get(key)!.weight += 1;
       } else {
+        // Don't create ghost placeholder nodes for links into excluded subtrees
+        // (raw/ sources, code/ repos, docs/) — e.g. raw_source links. They are not
+        // part of the markdown graph.
+        if (target.toLowerCase().split(/[\\/]/).some((seg) => NON_BRAIN_SUBTREES.has(seg))) {
+          continue;
+        }
         if (!nodes.has(key)) {
           nodes.set(key, {
             id: key,
