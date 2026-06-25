@@ -71,6 +71,7 @@ import {
   createMarkdownFileInDirectory,
   createSubfolderInDirectory,
   createSubBrainInDirectory,
+  deleteFolderInVault,
   createVaultId,
   extractLinks,
   fileTitle,
@@ -137,7 +138,10 @@ function FolderNode({
   onCreateFolderInFolder,
   onCreateSubBrainInFolder,
   onSetVaultColor,
+  onSetBrainColor,
+  storedBrainColors,
   onDeleteBrain,
+  onDeleteSubBrain,
   canDeleteBrain,
   asBrain = false,
   isVaultRoot = false,
@@ -153,7 +157,10 @@ function FolderNode({
   onCreateFolderInFolder: (folder: WikiFolder) => void;
   onCreateSubBrainInFolder: (folder: WikiFolder) => void;
   onSetVaultColor: (color: string | undefined) => void;
+  onSetBrainColor: (key: string, color: string | undefined) => void;
+  storedBrainColors: Record<string, string>;
   onDeleteBrain?: () => void;
+  onDeleteSubBrain: (folder: WikiFolder) => void;
   canDeleteBrain?: boolean;
   // asBrain: render this folder itself as a (sub-)brain even at depth 0 (used when
   // the sidebar promotes a nested {name}-brain folder to a top-level brain section).
@@ -181,12 +188,16 @@ function FolderNode({
   const isBrainFolder = Boolean(brainAnchor);
   const displayFiles = brainAnchor ? folder.files.filter((f) => f.id !== brainAnchor.id) : folder.files;
   const folderLabel = brainAnchor ? fileTitle(brainAnchor) : folder.name;
+  // Per-brain colour key (vault id for the vault root, folder path for sub-brains)
+  // — so every (sub-)brain, nested ones included, can have its own colour.
+  const colorKey = isVaultRoot ? folder.vaultId : folder.path;
+  const brainColor = isBrainFolder ? (storedBrainColors[colorKey] ?? vaultColor) : vaultColor;
 
   return (
     <div className="treeNode">
       <div
         className={`treeRow folderRow ${isBrainFolder ? 'brainFolderRow' : ''} ${isLockedFolder ? 'locked' : ''}`}
-        style={{ paddingLeft }}
+        style={isBrainFolder ? ({ paddingLeft, ['--brain-color' as string]: brainColor } as React.CSSProperties) : { paddingLeft }}
         onMouseEnter={() => onHoverScope({ type: 'folder', vaultId: folder.vaultId, folderPath: folder.path })}
         onMouseLeave={onClearHover}
       >
@@ -238,14 +249,14 @@ function FolderNode({
           >
             <Brain size={13} />
           </button>
-          {(isVaultRoot || asBrain) && (
+          {(isVaultRoot || isBrainFolder) && (
             <div className="colorPickerWrapper">
               <button
                 type="button"
                 className="folderActionIcon"
                 title="Brain colour"
                 aria-label="Set Brain colour"
-                style={{ color: vaultColor }}
+                style={{ color: brainColor }}
                 onClick={(event) => {
                   event.stopPropagation();
                   setColorPickerOpen((open) => !open);
@@ -259,12 +270,13 @@ function FolderNode({
                     <button
                       key={swatch}
                       type="button"
-                      className={`colorSwatch ${swatch === vaultColor ? 'active' : ''}`}
+                      className={`colorSwatch ${swatch === brainColor ? 'active' : ''}`}
                       style={{ background: swatch }}
                       title={swatch}
                       aria-label={`Set colour ${swatch}`}
                       onClick={() => {
-                        onSetVaultColor(swatch);
+                        onSetBrainColor(colorKey, swatch);
+                        if (isVaultRoot) onSetVaultColor(swatch);
                         setColorPickerOpen(false);
                       }}
                     />
@@ -273,7 +285,8 @@ function FolderNode({
                     type="button"
                     className="colorSwatchReset"
                     onClick={() => {
-                      onSetVaultColor(undefined);
+                      onSetBrainColor(colorKey, undefined);
+                      if (isVaultRoot) onSetVaultColor(undefined);
                       setColorPickerOpen(false);
                     }}
                   >
@@ -298,6 +311,20 @@ function FolderNode({
               <Trash2 size={13} />
             </button>
           )}
+          {!isVaultRoot && isBrainFolder && (
+            <button
+              type="button"
+              className="folderActionIcon folderActionIcon--danger"
+              title="Delete sub-brain"
+              aria-label="Delete sub-brain"
+              onClick={(event) => {
+                event.stopPropagation();
+                onDeleteSubBrain(folder);
+              }}
+            >
+              <Trash2 size={13} />
+            </button>
+          )}
         </div>
       </div>
       {expanded && (
@@ -316,6 +343,9 @@ function FolderNode({
               onCreateFolderInFolder={onCreateFolderInFolder}
               onCreateSubBrainInFolder={onCreateSubBrainInFolder}
               onSetVaultColor={onSetVaultColor}
+              onSetBrainColor={onSetBrainColor}
+              storedBrainColors={storedBrainColors}
+              onDeleteSubBrain={onDeleteSubBrain}
             />
           ))}
           {displayFiles.map((file) => {
@@ -2092,6 +2122,7 @@ function WikiSidebar({
   onSetBrainColor,
   colorTick,
   onDeleteVault,
+  onDeleteSubBrain,
   canDeleteVault,
 }: {
   vaults: WikiVault[];
@@ -2112,6 +2143,7 @@ function WikiSidebar({
   onSetBrainColor: (key: string, color: string | undefined) => void;
   colorTick: number;
   onDeleteVault: (vaultId: string) => void;
+  onDeleteSubBrain: (folder: WikiFolder) => void;
   canDeleteVault: (vaultId: string) => boolean;
 }) {
   // Re-read per-brain colours each render; colorTick changes force a refresh.
@@ -2252,9 +2284,11 @@ function WikiSidebar({
                 onCreateFolderInFolder={onCreateFolderInFolder}
                 onCreateSubBrainInFolder={onCreateSubBrainInFolder}
                 onSetVaultColor={(c) => {
-                  onSetBrainColor(colorKey, c);
                   if (section.isVault) onSetVaultColor(section.vaultId, c);
                 }}
+                onSetBrainColor={onSetBrainColor}
+                storedBrainColors={storedBrainColors}
+                onDeleteSubBrain={onDeleteSubBrain}
                 onDeleteBrain={section.isVault ? () => onDeleteVault(section.vaultId) : undefined}
                 canDeleteBrain={section.isVault ? canDeleteVault(section.vaultId) : false}
               />
@@ -2922,6 +2956,35 @@ export default function Home() {
     [currentActor.id, memberships, selectFile, setActiveVault, setEditorMode, updateVault, vaults],
   );
 
+  const deleteSubBrain = useCallback(
+    async (folder: WikiFolder) => {
+      const role = getActorBrainRole(memberships, folder.vaultId, currentActor.id);
+      if (!roleCanEdit(role)) {
+        setError('You do not have permission to delete sub-brains in this Brain.');
+        return;
+      }
+      const vault = vaults.find((entry) => entry.id === folder.vaultId);
+      if (!vault) return;
+      if (!window.confirm(`Delete the sub-brain "${folder.name}" and everything in it? This cannot be undone.`)) {
+        return;
+      }
+      try {
+        if (!(await hasVaultPermission(vault.rootHandle, true))) {
+          setError('Write access was not granted.');
+          return;
+        }
+        await deleteFolderInVault(vault.rootHandle, folder.path);
+        const { vault: refreshedVault } = await loadVault(vault.rootHandle, vault.id, vault.name);
+        updateVault(refreshedVault);
+        await saveWikiVaultHandles(useWikiStore.getState().vaults);
+        setError(null);
+      } catch (err) {
+        setError((err as Error).message || 'Sub-Brain could not be deleted.');
+      }
+    },
+    [currentActor.id, memberships, updateVault, vaults],
+  );
+
   const [brainColorTick, setBrainColorTick] = useState(0);
   const handleSetBrainColor = useCallback((key: string, color: string | undefined) => {
     setStoredBrainColor(key, color);
@@ -3198,6 +3261,7 @@ export default function Home() {
               onCreateSubBrainInFolder={createSubBrainInFolder}
               colorTick={brainColorTick}
               onSetBrainColor={handleSetBrainColor}
+              onDeleteSubBrain={deleteSubBrain}
               onSetVaultColor={handleSetVaultColor}
               onDeleteVault={handleDeleteVault}
               canDeleteVault={canDeleteVault}

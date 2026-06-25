@@ -144,6 +144,21 @@ export const VAULT_PALETTE = [
   '#14b8a6', // teal
 ] as const;
 
+// Delete a (sub-)brain folder from a vault by its full path (which includes the
+// vault root segment). Removes the folder and everything in it.
+export async function deleteFolderInVault(
+  rootHandle: FileSystemDirectoryHandle,
+  folderPath: string,
+): Promise<void> {
+  const parts = folderPath.split('/').filter(Boolean).slice(1); // drop vault root segment
+  if (parts.length === 0) throw new Error('Cannot delete the vault root.');
+  let dir = rootHandle;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    dir = await dir.getDirectoryHandle(parts[i]);
+  }
+  await dir.removeEntry(parts[parts.length - 1], { recursive: true });
+}
+
 // Per-brain colours, keyed by a brain key (vault id or sub-brain folder path),
 // persisted in localStorage so each (sub-)brain can have its own colour.
 const BRAIN_COLOR_STORE = 'brain-colors';
