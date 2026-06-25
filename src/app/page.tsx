@@ -21,6 +21,12 @@ import {
   type NodeProps,
   type ReactFlowInstance,
 } from '@xyflow/react';
+import type {
+  GraphFilterMode,
+  SchemaGraphPayload,
+  SchemaGraphRawSource,
+  SchemaGraphTable,
+} from '@/lib/brain/schema-graph-types';
 import {
   forceCenter,
   forceCollide,
@@ -35,6 +41,7 @@ import {
 import {
   ArrowLeft,
   BookOpen,
+  Brain,
   ChevronDown,
   ChevronRight,
   FilePlus2,
@@ -154,10 +161,19 @@ function FolderNode({
     (graphScope.type === 'folder' && graphScope.vaultId === folder.vaultId && graphScope.folderPath === folder.path) ||
     (depth === 0 && graphScope.type === 'vault' && graphScope.vaultId === folder.vaultId);
 
+  // A nested folder that holds a `{name}-brain.md` anchor is itself a Sub-Brain:
+  // render it as a brain (brain icon + anchor title), nested under its parent, and
+  // hide the anchor file from the file list (the row represents it). The vault root
+  // (depth 0) is already the Big Brain section, so only nested folders graduate.
+  const brainAnchor = depth > 0 ? folder.files.find((f) => /-brain\.md$/i.test(f.name)) : undefined;
+  const isBrainFolder = Boolean(brainAnchor);
+  const displayFiles = brainAnchor ? folder.files.filter((f) => f.id !== brainAnchor.id) : folder.files;
+  const folderLabel = brainAnchor ? fileTitle(brainAnchor) : folder.name;
+
   return (
     <div className="treeNode">
       <div
-        className={`treeRow folderRow ${isLockedFolder ? 'locked' : ''}`}
+        className={`treeRow folderRow ${isBrainFolder ? 'brainFolderRow' : ''} ${isLockedFolder ? 'locked' : ''}`}
         style={{ paddingLeft }}
         onMouseEnter={() => onHoverScope({ type: 'folder', vaultId: folder.vaultId, folderPath: folder.path })}
         onMouseLeave={onClearHover}
@@ -168,10 +184,10 @@ function FolderNode({
         <button
           type="button"
           className="folderMain"
-          onClick={() => onFolderCluster(folder)}
+          onClick={() => (brainAnchor ? selectFile(brainAnchor.id) : onFolderCluster(folder))}
         >
-          <FolderOpen size={14} />
-          <span>{folder.name}</span>
+          {isBrainFolder ? <Brain size={14} /> : <FolderOpen size={14} />}
+          <span>{folderLabel}</span>
         </button>
         <div className="folderActions">
           <button
@@ -280,7 +296,7 @@ function FolderNode({
               onSetVaultColor={onSetVaultColor}
             />
           ))}
-          {folder.files.map((file) => {
+          {displayFiles.map((file) => {
             const lint = lintMap.get(file.id);
             return (
               <button
@@ -483,7 +499,9 @@ function computeLayout(rawNodes: GraphNode[], rawEdges: GraphEdge[]): {
     .force('relationY', forceY<SimNode>((d) => (d.brain || d.subBrain ? 0 : relationCenters.get(d.id)?.y ?? 0)).strength(0.03))
     .force(
       'collide',
-      forceCollide<SimNode>((d) => 64 + Math.sqrt(d.weight) * 9).strength(0.9),
+      // Hitbox radius: half the rendered NODE_HITBOX plus a gap, scaled a little by
+      // weight. Guarantees node centers stay >= one hitbox apart.
+      forceCollide<SimNode>((d) => NODE_HITBOX / 2 + 8 + Math.sqrt(Math.max(d.weight, 1)) * 9).strength(1),
     )
     .stop();
 
@@ -495,6 +513,15 @@ function computeLayout(rawNodes: GraphNode[], rawEdges: GraphEdge[]): {
         ? 48
         : Math.min(90, Math.max(42, Math.ceil(Math.log(simNodes.length + 1) * 24)));
   for (let i = 0; i < ticks; i++) sim.tick();
+
+  // Final overlap-resolution pass: collision only (no clustering/charge pulling
+  // nodes back together), so no two node hitboxes overlap. Runs until stable or a
+  // hard cap. Nodes are not pinned (no fx/fy), so collide can separate them freely.
+  const collideRadius = (d: SimNode) => NODE_HITBOX / 2 + 8 + Math.sqrt(Math.max(d.weight, 1)) * 9;
+  const relax = forceSimulation<SimNode>(simNodes)
+    .force('collide', forceCollide<SimNode>(collideRadius).strength(1).iterations(4))
+    .stop();
+  for (let i = 0; i < 120; i++) relax.tick();
 
   const rawById = new Map(rawNodes.map((node) => [node.id, node]));
   const nodes = new Map<
@@ -568,8 +595,105 @@ type WikiEdgeData = {
   [key: string]: unknown;
 };
 
-const nodeTypes = { wiki: WikiNodeView };
-const edgeTypes = { wiki: WikiEdgeView };
+type SchemaNodeData = {
+  label: string;
+  kind: 'table' | 'rawSource';
+  detail?: string;
+  ownerName?: string | null;
+  [key: string]: unknown;
+};
+
+function TableNodeView({ data }: NodeProps<Node<SchemaNodeData>>) {
+  return (
+    <div className="schemaNode schemaNode--table" title={data.detail || data.label}>
+      <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
+      <span className="schemaNode__kind">table</span>
+      <span className="schemaNode__label">{data.label}</span>
+      {data.ownerName ? <span className="schemaNode__owner">{data.ownerName}</span> : null}
+      <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
+    </div>
+  );
+}
+
+function RawSourceNodeView({ data }: NodeProps<Node<SchemaNodeData>>) {
+  return (
+    <div className="schemaNode schemaNode--raw" title={data.detail || data.label}>
+      <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
+      <span className="schemaNode__kind">source</span>
+      <span className="schemaNode__label">{data.label}</span>
+      <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
+    </div>
+  );
+}
+
+function SchemaEdgeView({ sourceX, sourceY, targetX, targetY }: EdgeProps) {
+  const [path] = getStraightPath({ sourceX, sourceY, targetX, targetY });
+  return <BaseEdge path={path} style={{ stroke: 'rgba(37,99,235,0.45)', strokeWidth: 1.5, strokeDasharray: '4 4' }} />;
+}
+
+const nodeTypes = { wiki: WikiNodeView, table: TableNodeView, rawSource: RawSourceNodeView };
+const edgeTypes = { wiki: WikiEdgeView, schema: SchemaEdgeView };
+
+// Deterministic side-by-side layout for the database/hybrid graph.
+function buildSchemaFlow(payload: SchemaGraphPayload): {
+  nodes: Node<SchemaNodeData>[];
+  edges: Edge[];
+} {
+  const COL_W = 360;
+  const ROW_H = 150;
+  const PER_COL = 4;
+  const ORIGIN_X = 1200; // place to the right of the markdown cluster in hybrid mode
+  const tablePos = new Map<string, { x: number; y: number }>();
+
+  const tableNodes: Node<SchemaNodeData>[] = payload.tables.map((table: SchemaGraphTable, index) => {
+    const x = ORIGIN_X + Math.floor(index / PER_COL) * COL_W;
+    const y = (index % PER_COL) * ROW_H;
+    tablePos.set(table.id, { x, y });
+    return {
+      id: table.id,
+      type: 'table',
+      position: { x, y },
+      data: {
+        label: table.label,
+        kind: 'table',
+        detail: `${table.tableName} · ${table.keyColumns.join(', ')}`,
+        ownerName: table.agentOwnerName,
+      },
+      draggable: true,
+      selectable: false,
+    };
+  });
+
+  const rawColX = ORIGIN_X + (Math.ceil(payload.tables.length / PER_COL) + 1) * COL_W;
+  const rawNodes: Node<SchemaNodeData>[] = payload.rawSources.map((source: SchemaGraphRawSource, index) => ({
+    id: source.id,
+    type: 'rawSource',
+    position: { x: rawColX, y: index * (ROW_H * 0.8) },
+    data: { label: source.label, kind: 'rawSource', detail: source.path, ownerName: source.agentOwnerName },
+    draggable: true,
+    selectable: false,
+  }));
+
+  const fkEdges: Edge[] = payload.relations.map((relation) => ({
+    id: relation.id,
+    source: relation.sourceTableId,
+    target: relation.targetTableId,
+    type: 'schema',
+  }));
+
+  const rawEdges: Edge[] = payload.rawSources.flatMap((source) =>
+    source.relatedTableIds
+      .filter((tableId) => tablePos.has(tableId))
+      .map((tableId) => ({
+        id: `raw-edge:${source.id}:${tableId}`,
+        source: source.id,
+        target: tableId,
+        type: 'schema',
+      })),
+  );
+
+  return { nodes: [...tableNodes, ...rawNodes], edges: [...fkEdges, ...rawEdges] };
+}
 
 function GraphView({
   onClearSelections,
@@ -590,6 +714,35 @@ function GraphView({
   const [searchQuery, setSearchQuery] = useState('');
   const runSearch = useWikiSearch(flatFiles);
   const rfInstance = useRef<ReactFlowInstance<Node<WikiNodeData>, Edge<WikiEdgeData>> | null>(null);
+
+  // Hybrid graph: markdown documents + the Supabase brain schema (tables, FKs, raw sources).
+  const [graphMode, setGraphMode] = useState<GraphFilterMode>('markdown');
+  const [schemaGraph, setSchemaGraph] = useState<SchemaGraphPayload | null>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (graphMode === 'markdown' || schemaGraph) return;
+    let cancelled = false;
+    fetch('/api/brain/schema-graph')
+      .then((response) => response.json())
+      .then((payload) => {
+        if (cancelled) return;
+        if (payload?.success) {
+          setSchemaGraph(payload as SchemaGraphPayload);
+          setSchemaError(null);
+        } else {
+          setSchemaError(payload?.message || 'Schema graph unavailable. Configure Supabase to enable the database layer.');
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setSchemaError(error instanceof Error ? error.message : 'Schema graph request failed.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [graphMode, schemaGraph]);
+
+  const schemaFlow = useMemo(() => (schemaGraph ? buildSchemaFlow(schemaGraph) : null), [schemaGraph]);
 
   const graphInputKey = useMemo(
     () =>
@@ -723,18 +876,33 @@ function GraphView({
     });
   }, [layout.edges, layout.nodes, vaultColorMap]);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node<WikiNodeData>>(baseNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge<WikiEdgeData>>(baseEdges);
-  const nextNodesRef = useRef(baseNodes);
-  const nextEdgesRef = useRef(baseEdges);
-  nextNodesRef.current = baseNodes;
-  nextEdgesRef.current = baseEdges;
+  const combinedNodes = useMemo<Node<WikiNodeData>[]>(() => {
+    const dbNodes = (schemaFlow?.nodes ?? []) as unknown as Node<WikiNodeData>[];
+    if (graphMode === 'database') return dbNodes;
+    if (graphMode === 'hybrid') return [...baseNodes, ...dbNodes];
+    return baseNodes;
+  }, [baseNodes, schemaFlow, graphMode]);
+
+  const combinedEdges = useMemo<Edge<WikiEdgeData>[]>(() => {
+    const dbEdges = (schemaFlow?.edges ?? []) as unknown as Edge<WikiEdgeData>[];
+    if (graphMode === 'database') return dbEdges;
+    if (graphMode === 'hybrid') return [...baseEdges, ...dbEdges];
+    return baseEdges;
+  }, [baseEdges, schemaFlow, graphMode]);
+
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node<WikiNodeData>>(combinedNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge<WikiEdgeData>>(combinedEdges);
+  const nextNodesRef = useRef(combinedNodes);
+  const nextEdgesRef = useRef(combinedEdges);
+  nextNodesRef.current = combinedNodes;
+  nextEdgesRef.current = combinedEdges;
 
   const graphKey = useMemo(() => {
     const nodeIds = Array.from(layout.nodes.keys()).sort().join('|');
     const edgeIds = layout.edges.map((edge) => edge.id).sort().join('|');
-    return `${nodeIds}::${edgeIds}`;
-  }, [layout.edges, layout.nodes]);
+    const dbKey = `${graphMode}:${schemaFlow?.nodes.length ?? 0}:${schemaFlow?.edges.length ?? 0}`;
+    return `${nodeIds}::${edgeIds}::${dbKey}`;
+  }, [layout.edges, layout.nodes, graphMode, schemaFlow]);
 
   useEffect(() => {
     setNodes(nextNodesRef.current);
@@ -746,7 +914,7 @@ function GraphView({
 
   useEffect(() => {
     const id = requestAnimationFrame(() => {
-      rfInstance.current?.fitView({ padding: 0.25 });
+      rfInstance.current?.fitView({ padding: 0.3, maxZoom: 0.9 });
     });
     return () => cancelAnimationFrame(id);
   }, [graphKey]);
@@ -788,12 +956,29 @@ function GraphView({
           onQueryChange={setSearchQuery}
           onSelect={(id) => setGraphPreview(id)}
         />
+        <div className="graphModePanel">
+          {(['markdown', 'database', 'hybrid'] as GraphFilterMode[]).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              className={graphMode === mode ? 'is-active' : ''}
+              onClick={() => setGraphMode(mode)}
+            >
+              {mode}
+            </button>
+          ))}
+          {schemaError && graphMode !== 'markdown' ? (
+            <span className="graphModePanel__error" title={schemaError}>
+              DB layer unavailable
+            </span>
+          ) : null}
+        </div>
         <ReactFlow
           nodes={nodes}
           edges={edges}
           onInit={(instance) => {
             rfInstance.current = instance;
-            instance.fitView({ padding: 0.25 });
+            instance.fitView({ padding: 0.3, maxZoom: 0.9 });
           }}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}

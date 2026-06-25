@@ -1428,6 +1428,74 @@ input.propValue:focus {
   left: auto;
 }
 
+/* Markdown / database / hybrid graph filter toggle. */
+.graphModePanel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--surface-1, rgba(255, 255, 255, 0.9));
+  border: 1px solid var(--border, rgba(15, 23, 42, 0.1));
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+}
+.graphModePanel button {
+  border: none;
+  background: transparent;
+  color: var(--muted, #64748b);
+  font-size: 12px;
+  text-transform: capitalize;
+  padding: 4px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.graphModePanel button.is-active {
+  background: rgba(37, 99, 235, 0.12);
+  color: #2563eb;
+  font-weight: 600;
+}
+.graphModePanel__error {
+  font-size: 11px;
+  color: #b91c1c;
+  padding: 0 6px;
+}
+
+/* Database/raw-source nodes in the hybrid graph. */
+.schemaNode {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid rgba(37, 99, 235, 0.35);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+  font-size: 12px;
+}
+.schemaNode--raw {
+  border-color: rgba(217, 119, 6, 0.4);
+  background: #fffbeb;
+}
+.schemaNode__kind {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted, #94a3b8);
+}
+.schemaNode__label {
+  font-weight: 600;
+  color: #0f172a;
+}
+.schemaNode__owner {
+  font-size: 10px;
+  color: #2563eb;
+}
+
 .graphSearchPanel {
   position: absolute;
   top: 16px;
@@ -1822,4 +1890,16 @@ input.propValue:focus {
   color: var(--muted);
   font-size: 13px;
   padding: 5px 0;
+}
+
+/* Nested sub-brain folders rendered as their own (nested) brains in the sidebar */
+.treeRow.folderRow.brainFolderRow {
+  border-left: 2px solid var(--brain-color, var(--accent));
+}
+.treeRow.folderRow.brainFolderRow .folderMain {
+  font-weight: 600;
+}
+.treeRow.folderRow.brainFolderRow .folderMain span,
+.treeRow.folderRow.brainFolderRow .folderMain svg {
+  color: var(--brain-color, var(--accent));
 }
