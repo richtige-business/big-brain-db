@@ -135,6 +135,8 @@ function FolderNode({
   onSetVaultColor,
   onDeleteBrain,
   canDeleteBrain,
+  asBrain = false,
+  isVaultRoot = false,
 }: {
   folder: WikiFolder;
   depth: number;
@@ -148,6 +150,11 @@ function FolderNode({
   onSetVaultColor: (color: string | undefined) => void;
   onDeleteBrain?: () => void;
   canDeleteBrain?: boolean;
+  // asBrain: render this folder itself as a (sub-)brain even at depth 0 (used when
+  // the sidebar promotes a nested {name}-brain folder to a top-level brain section).
+  asBrain?: boolean;
+  // isVaultRoot: this folder is an actual added vault root (shows vault colour/delete).
+  isVaultRoot?: boolean;
 }) {
   const expanded = useWikiStore((state) => state.expandedFolders.has(folder.id));
   const toggle = useWikiStore((state) => state.toggleFolder);
@@ -165,7 +172,7 @@ function FolderNode({
   // render it as a brain (brain icon + anchor title), nested under its parent, and
   // hide the anchor file from the file list (the row represents it). The vault root
   // (depth 0) is already the Big Brain section, so only nested folders graduate.
-  const brainAnchor = depth > 0 ? folder.files.find((f) => /-brain\.md$/i.test(f.name)) : undefined;
+  const brainAnchor = (asBrain || depth > 0) ? folder.files.find((f) => /-brain\.md$/i.test(f.name)) : undefined;
   const isBrainFolder = Boolean(brainAnchor);
   const displayFiles = brainAnchor ? folder.files.filter((f) => f.id !== brainAnchor.id) : folder.files;
   const folderLabel = brainAnchor ? fileTitle(brainAnchor) : folder.name;
@@ -214,7 +221,7 @@ function FolderNode({
           >
             <FolderPlus size={13} />
           </button>
-          {depth === 0 && (
+          {isVaultRoot && (
             <div className="colorPickerWrapper">
               <button
                 type="button"
@@ -262,7 +269,7 @@ function FolderNode({
               )}
             </div>
           )}
-          {depth === 0 && onDeleteBrain && (
+          {isVaultRoot && onDeleteBrain && (
             <button
               type="button"
               className="folderActionIcon folderActionIcon--danger"
@@ -1934,6 +1941,13 @@ function LogHistoryPanel({
   );
 }
 
+// Collect every folder that holds a `{name}-brain.md` anchor (a sub-brain).
+function collectBrainAnchorFolders(folder: WikiFolder, out: WikiFolder[] = []): WikiFolder[] {
+  if (folder.files.some((f) => /-brain\.md$/i.test(f.name))) out.push(folder);
+  for (const child of folder.folders) collectBrainAnchorFolders(child, out);
+  return out;
+}
+
 function WikiSidebar({
   vaults,
   activeVaultId,
@@ -1973,6 +1987,30 @@ function WikiSidebar({
 
   const allFiles = useMemo(() => vaults.flatMap((v) => v.flatFiles), [vaults]);
   const [lintMap, setLintMap] = useState<Map<string, FileLint>>(new Map());
+
+  // Brain sections shown under the BIG BRAIN header. A vault with NO nested
+  // sub-brain folders renders as one brain (the vault = native model / "A"). A vault
+  // WITH nested {name}-brain folders gets each TOP-LEVEL sub-brain promoted to its own
+  // section ("B"); the vault root itself (big-brain config) is not a separate row.
+  const brainSections = useMemo(() => {
+    type Section = { key: string; folder: WikiFolder; vaultId: string; color: string; isVault: boolean };
+    const sections: Section[] = [];
+    for (const vault of vaults) {
+      const color = getVaultColor(vault);
+      const anchors = collectBrainAnchorFolders(vault.tree).filter((f) => f.path !== vault.tree.path);
+      if (anchors.length === 0) {
+        sections.push({ key: vault.id, folder: vault.tree, vaultId: vault.id, color, isVault: true });
+      } else {
+        const topLevel = anchors.filter(
+          (f) => !anchors.some((o) => o.path !== f.path && f.path.startsWith(`${o.path}/`)),
+        );
+        for (const bf of topLevel) {
+          sections.push({ key: bf.id, folder: bf, vaultId: vault.id, color, isVault: false });
+        }
+      }
+    }
+    return sections;
+  }, [vaults]);
 
   useEffect(() => {
     const timeout = window.setTimeout(
@@ -2045,34 +2083,41 @@ function WikiSidebar({
         )}
       </div>
       <div className="wikiList">
-        {vaults.map((vault) => {
-          const color = getVaultColor(vault);
-          const collaborators = collaboratorsForVault(vault.id, memberships, actors);
+        {brainSections.map((section) => {
+          const collaborators = section.isVault
+            ? collaboratorsForVault(section.vaultId, memberships, actors)
+            : [];
           const useInitials = collaborators.length > 5;
           return (
             <section
-              className={`wikiSection ${activeVaultId === vault.id ? 'active' : ''}`}
-              key={vault.id}
-              style={{ '--brain-color': color } as React.CSSProperties}
-              onMouseEnter={() => onHoverScope({ type: 'vault', vaultId: vault.id })}
+              className={`wikiSection ${activeVaultId === section.vaultId ? 'active' : ''}`}
+              key={section.key}
+              style={{ '--brain-color': section.color } as React.CSSProperties}
+              onMouseEnter={() =>
+                section.isVault
+                  ? onHoverScope({ type: 'vault', vaultId: section.vaultId })
+                  : onHoverScope({ type: 'folder', vaultId: section.vaultId, folderPath: section.folder.path })
+              }
               onMouseLeave={onClearHover}
             >
               <FolderNode
-                folder={vault.tree}
+                folder={section.folder}
                 depth={0}
-                vaultColor={color}
+                asBrain={!section.isVault}
+                isVaultRoot={section.isVault}
+                vaultColor={section.color}
                 lintMap={lintMap}
                 onFolderCluster={onFolderCluster}
                 onHoverScope={onHoverScope}
                 onClearHover={onClearHover}
                 onCreateMarkdownInFolder={onCreateMarkdownInFolder}
                 onCreateFolderInFolder={onCreateFolderInFolder}
-                onSetVaultColor={(c) => onSetVaultColor(vault.id, c)}
-                onDeleteBrain={() => onDeleteVault(vault.id)}
-                canDeleteBrain={canDeleteVault(vault.id)}
+                onSetVaultColor={(c) => onSetVaultColor(section.vaultId, c)}
+                onDeleteBrain={section.isVault ? () => onDeleteVault(section.vaultId) : undefined}
+                canDeleteBrain={section.isVault ? canDeleteVault(section.vaultId) : false}
               />
               {collaborators.length > 0 && (
-                <div className="sidebarCollaborators" aria-label={`Collaborators for ${vault.name}`}>
+                <div className="sidebarCollaborators" aria-label="Collaborators">
                   <span className="sidebarCollaboratorsTitle">Collaborators</span>
                   <div className={useInitials ? 'sidebarCollaboratorInitials' : 'sidebarCollaboratorNames'}>
                     {collaborators.map((name) => (
