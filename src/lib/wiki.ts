@@ -893,12 +893,25 @@ export function buildGraph(files: WikiFile[]): { nodes: GraphNode[]; edges: Grap
   const vaultsById = new Map<string, string>();
   for (const file of files) vaultsById.set(file.vaultId, file.vaultName);
 
-  // Detect nested sub-brain folders + the vault each belongs to.
+  // Detect nested sub-brain folders + the vault each belongs to. Skip anchors inside
+  // non-curated subtrees (raw/ sources, code/ repos + their demo-wikis, deps) so they
+  // don't become spurious sub-brain nodes.
+  const NON_BRAIN_SUBTREES = new Set([
+    'raw', 'code', 'demo-wikis', 'docs', 'node_modules', '.git', '.next', '.obsidian',
+    'venv', '__pycache__', 'dist', 'build', '.worktrees',
+  ]);
   const brainFolders = new Set<string>();
   const folderVaultId = new Map<string, string>();
   for (const file of files) {
     const parts = file.path.split('/').filter(Boolean);
-    if (parts.length >= 3 && file.name.toLowerCase().endsWith('-brain.md')) {
+    if (parts.length < 3) continue;
+    // parts[0] is the vault root; skip anchors inside non-curated subtrees.
+    if (parts.slice(1, -1).some((seg) => NON_BRAIN_SUBTREES.has(seg))) continue;
+    // A folder is a sub-brain only if it holds its OWN name-matching anchor file
+    // (e.g. `vision-brain/vision-brain.md`), not just any `*-brain.md`.
+    const folderName = parts[parts.length - 2].toLowerCase();
+    const expected = folderName.endsWith('-brain') ? `${folderName}.md` : `${folderName}-brain.md`;
+    if (file.name.toLowerCase() === expected) {
       brainFolders.add(parts.slice(0, -1).join('/'));
     }
   }
@@ -932,7 +945,16 @@ export function buildGraph(files: WikiFile[]): { nodes: GraphNode[]; edges: Grap
     return vaultBrainNodeId(folderVaultId.get(folder) || '');
   };
 
-  const visibleFiles = files.filter((file) => !isBrainMetaFile(file) && !isSubBrainMeta(file));
+  // Markdown graph = curated knowledge base only. Exclude meta files and anything in
+  // non-curated subtrees (raw/ sources, code/ repos, docs/, deps) — those live in the
+  // database/hybrid view, not the markdown graph.
+  const inNonBrainSubtree = (file: WikiFile): boolean => {
+    const parts = file.path.split('/').filter(Boolean);
+    return parts.slice(1).some((seg) => NON_BRAIN_SUBTREES.has(seg));
+  };
+  const visibleFiles = files.filter(
+    (file) => !isBrainMetaFile(file) && !isSubBrainMeta(file) && !inNonBrainSubtree(file),
+  );
 
   nodes.set(BRAIN_NODE_ID, {
     id: BRAIN_NODE_ID,

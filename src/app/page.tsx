@@ -172,7 +172,7 @@ function FolderNode({
   // render it as a brain (brain icon + anchor title), nested under its parent, and
   // hide the anchor file from the file list (the row represents it). The vault root
   // (depth 0) is already the Big Brain section, so only nested folders graduate.
-  const brainAnchor = (asBrain || depth > 0) ? folder.files.find((f) => /-brain\.md$/i.test(f.name)) : undefined;
+  const brainAnchor = (asBrain || depth > 0) ? brainAnchorOf(folder) : undefined;
   const isBrainFolder = Boolean(brainAnchor);
   const displayFiles = brainAnchor ? folder.files.filter((f) => f.id !== brainAnchor.id) : folder.files;
   const folderLabel = brainAnchor ? fileTitle(brainAnchor) : folder.name;
@@ -1941,10 +1941,31 @@ function LogHistoryPanel({
   );
 }
 
-// Collect every folder that holds a `{name}-brain.md` anchor (a sub-brain).
+// Folders that are sources/code/deps, not curated wiki sub-brains. We never promote
+// `{name}-brain.md` anchors found inside these (e.g. raw/ sources, code/ repos and
+// their demo-wikis) to sidebar/graph sub-brains.
+const NON_BRAIN_SUBTREES = new Set([
+  'raw', 'code', 'demo-wikis', 'docs', 'node_modules', '.git', '.next', '.obsidian',
+  'venv', '__pycache__', 'dist', 'build', '.worktrees',
+]);
+
+// A folder is a sub-brain only if it contains its OWN name-matching anchor file
+// (`vision-brain/` → `vision-brain.md`). This avoids false positives like a plan doc
+// `2026-...-la-chaine-brain.md` that merely ends in `-brain.md`.
+function brainAnchorOf(folder: WikiFolder): WikiFile | undefined {
+  const n = folder.name.toLowerCase();
+  const expected = n.endsWith('-brain') ? `${n}.md` : `${n}-brain.md`;
+  return folder.files.find((f) => f.name.toLowerCase() === expected);
+}
+
+// Collect every sub-brain folder, skipping non-curated subtrees (raw/, code/, docs/,
+// demo-wikis, deps).
 function collectBrainAnchorFolders(folder: WikiFolder, out: WikiFolder[] = []): WikiFolder[] {
-  if (folder.files.some((f) => /-brain\.md$/i.test(f.name))) out.push(folder);
-  for (const child of folder.folders) collectBrainAnchorFolders(child, out);
+  if (brainAnchorOf(folder)) out.push(folder);
+  for (const child of folder.folders) {
+    if (NON_BRAIN_SUBTREES.has(child.name)) continue;
+    collectBrainAnchorFolders(child, out);
+  }
   return out;
 }
 
