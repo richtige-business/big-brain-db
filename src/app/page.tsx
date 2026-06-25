@@ -740,9 +740,11 @@ function buildSchemaFlow(payload: SchemaGraphPayload): {
 function GraphView({
   onClearSelections,
   onOpenEditor,
+  colorTick,
 }: {
   onClearSelections: () => void;
   onOpenEditor: (fileId: string) => void;
+  colorTick: number;
 }) {
   const flatFiles = useWikiStore((state) => state.flatFiles);
   const vaults = useWikiStore((state) => state.vaults);
@@ -904,10 +906,40 @@ function GraphView({
     return map;
   }, [vaults]);
 
+  // Per-node brain colour: each node inherits the colour of its owning brain
+  // (chosen per-brain colour, keyed by sub-brain folder path / vault id). Used so
+  // edges are drawn in their brain's colour.
+  const nodeBrainColor = useMemo(() => {
+    void colorTick; // recompute when a brain colour changes
+    const stored = getStoredBrainColors();
+    const map = new Map<string, string>();
+    for (const [id, n] of layout.nodes) {
+      if (id.startsWith('subbrain:')) {
+        const path = id.slice('subbrain:'.length);
+        const c = stored[path] ?? (n.vaultId ? vaultColorMap.get(n.vaultId) : undefined);
+        if (c) map.set(id, c);
+      } else if (n.subBrain || n.brain) {
+        const c = (n.vaultId ? stored[n.vaultId] ?? vaultColorMap.get(n.vaultId) : undefined);
+        if (c) map.set(id, c);
+      }
+    }
+    // Files inherit their owning sub-brain's colour via brainAnchor edges.
+    for (const e of layout.edges) {
+      if (e.brainAnchor && e.source.startsWith('subbrain:')) {
+        const c = map.get(e.source);
+        if (c && !map.has(e.target)) map.set(e.target, c);
+      }
+    }
+    return map;
+  }, [layout.nodes, layout.edges, vaultColorMap, colorTick]);
+
   const baseEdges = useMemo<Edge<WikiEdgeData>[]>(() => {
     return layout.edges.map((edge) => {
       const sourceNode = layout.nodes.get(edge.source);
-      const vaultColor = sourceNode?.vaultId ? (vaultColorMap.get(sourceNode.vaultId) ?? undefined) : undefined;
+      const vaultColor =
+        nodeBrainColor.get(edge.source) ??
+        nodeBrainColor.get(edge.target) ??
+        (sourceNode?.vaultId ? (vaultColorMap.get(sourceNode.vaultId) ?? undefined) : undefined);
       return {
         id: edge.id,
         source: edge.source,
@@ -916,7 +948,7 @@ function GraphView({
         data: { unresolved: edge.unresolved, brainMap: edge.brainMap, brainAnchor: edge.brainAnchor, vaultColor },
       };
     });
-  }, [layout.edges, layout.nodes, vaultColorMap]);
+  }, [layout.edges, layout.nodes, vaultColorMap, nodeBrainColor]);
 
   const combinedNodes = useMemo<Node<WikiNodeData>[]>(() => {
     const dbNodes = (schemaFlow?.nodes ?? []) as unknown as Node<WikiNodeData>[];
@@ -2190,7 +2222,10 @@ function WikiSidebar({
             ? collaboratorsForVault(section.vaultId, memberships, actors)
             : [];
           const useInitials = collaborators.length > 5;
-          const color = storedBrainColors[section.key] ?? section.color;
+          // Colour key is shared with the graph: folder path for sub-brains, vault id
+          // for vaults — so edge colours can match the chosen brain colour.
+          const colorKey = section.isVault ? section.vaultId : section.folder.path;
+          const color = storedBrainColors[colorKey] ?? section.color;
           return (
             <section
               className={`wikiSection ${activeVaultId === section.vaultId ? 'active' : ''}`}
@@ -2217,7 +2252,7 @@ function WikiSidebar({
                 onCreateFolderInFolder={onCreateFolderInFolder}
                 onCreateSubBrainInFolder={onCreateSubBrainInFolder}
                 onSetVaultColor={(c) => {
-                  onSetBrainColor(section.key, c);
+                  onSetBrainColor(colorKey, c);
                   if (section.isVault) onSetVaultColor(section.vaultId, c);
                 }}
                 onDeleteBrain={section.isVault ? () => onDeleteVault(section.vaultId) : undefined}
@@ -2674,6 +2709,20 @@ export default function Home() {
       setError((err as Error).message || 'Brains could not be reconnected.');
     }
   };
+
+  // Never make the user hunt for a Reconnect button: if the browser dropped the
+  // folder permission on reload, the very first user gesture (any click) silently
+  // re-grants and reloads the saved Brain. (requestPermission requires a user
+  // gesture — a hard browser rule — so one click is the minimum.)
+  useEffect(() => {
+    if (reconnectHandles.length === 0) return;
+    const handler = () => {
+      void reconnectVault();
+    };
+    window.addEventListener('pointerdown', handler, { once: true, capture: true });
+    return () => window.removeEventListener('pointerdown', handler, { capture: true } as EventListenerOptions);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reconnectHandles]);
 
   const forgetSavedBrains = async () => {
     await clearWikiVaultHandles();
@@ -3174,7 +3223,7 @@ export default function Home() {
 
         <main className="content">
           {activeView === 'graph' ? (
-            <GraphView onClearSelections={clearAllSelections} onOpenEditor={openEditorFromGraph} />
+            <GraphView onClearSelections={clearAllSelections} onOpenEditor={openEditorFromGraph} colorTick={brainColorTick} />
           ) : selectedFile && parsed ? (
             <div className="editorLayout">
               <div className="docHeader">
