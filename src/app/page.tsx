@@ -733,14 +733,19 @@ const nodeTypes = { wiki: WikiNodeView, table: TableNodeView, rawSource: RawSour
 const edgeTypes = { wiki: WikiEdgeView, schema: SchemaEdgeView };
 
 // Deterministic side-by-side layout for the database/hybrid graph.
-function buildSchemaFlow(payload: SchemaGraphPayload): {
+function buildSchemaFlow(
+  payload: SchemaGraphPayload,
+  // Position of the markdown brain node for a DB owner (scope id), so database
+  // entries sit right at their related markdown node in the hybrid view.
+  ownerPos?: (ownerId: string | null) => { x: number; y: number } | undefined,
+): {
   nodes: Node<SchemaNodeData>[];
   edges: Edge[];
 } {
   const COL_W = 360;
   const ROW_H = 150;
   const PER_COL = 4;
-  const ORIGIN_X = 1200; // place to the right of the markdown cluster in hybrid mode
+  const ORIGIN_X = 1200; // fallback placement (right of the markdown cluster)
   const tablePos = new Map<string, { x: number; y: number }>();
 
   const tableNodes: Node<SchemaNodeData>[] = payload.tables.map((table: SchemaGraphTable, index) => {
@@ -763,14 +768,20 @@ function buildSchemaFlow(payload: SchemaGraphPayload): {
   });
 
   const rawColX = ORIGIN_X + (Math.ceil(payload.tables.length / PER_COL) + 1) * COL_W;
-  const rawNodes: Node<SchemaNodeData>[] = payload.rawSources.map((source: SchemaGraphRawSource, index) => ({
-    id: source.id,
-    type: 'rawSource',
-    position: { x: rawColX, y: index * (ROW_H * 0.8) },
-    data: { label: source.label, kind: 'rawSource', detail: source.path, ownerName: source.agentOwnerName },
-    draggable: true,
-    selectable: false,
-  }));
+  const rawNodes: Node<SchemaNodeData>[] = payload.rawSources.map((source: SchemaGraphRawSource, index) => {
+    // Co-locate the DB entry with its related markdown brain node (small offset so
+    // both are visible); fall back to the column if there is no matching node.
+    const mp = ownerPos?.(source.agentOwnerId);
+    const position = mp ? { x: mp.x + 36, y: mp.y + 36 } : { x: rawColX, y: index * (ROW_H * 0.8) };
+    return {
+      id: source.id,
+      type: 'rawSource',
+      position,
+      data: { label: source.label, kind: 'rawSource', detail: source.path, ownerName: source.agentOwnerName },
+      draggable: true,
+      selectable: false,
+    };
+  });
 
   const fkEdges: Edge[] = payload.relations.map((relation) => ({
     id: relation.id,
@@ -842,8 +853,6 @@ function GraphView({
     };
   }, [graphMode, schemaGraph]);
 
-  const schemaFlow = useMemo(() => (schemaGraph ? buildSchemaFlow(schemaGraph) : null), [schemaGraph]);
-
   const graphInputKey = useMemo(
     () =>
       flatFiles
@@ -865,6 +874,23 @@ function GraphView({
     const graph = buildGraph(flatFiles);
     return computeLayout(graph.nodes, graph.edges);
   }, [graphInputKey]);
+
+  // Schema/DB flow: position each DB raw-source at its related markdown brain node
+  // (matched by sub-brain folder basename / 'brain' for the Big Brain).
+  const schemaFlow = useMemo(() => {
+    if (!schemaGraph) return null;
+    const byOwner = new Map<string, { x: number; y: number }>();
+    for (const [id, n] of layout.nodes) {
+      if (id.startsWith('subbrain:')) {
+        const base = id.slice('subbrain:'.length).split('/').filter(Boolean).pop();
+        if (base) byOwner.set(base, { x: n.x, y: n.y });
+      } else if (n.brain) {
+        byOwner.set('brain', { x: n.x, y: n.y });
+        byOwner.set('master', { x: n.x, y: n.y });
+      }
+    }
+    return buildSchemaFlow(schemaGraph, (ownerId) => (ownerId ? byOwner.get(ownerId) : undefined));
+  }, [schemaGraph, layout]);
 
   const neighbors = useMemo(() => {
     const map = new Map<string, Set<string>>();
