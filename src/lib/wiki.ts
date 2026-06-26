@@ -849,8 +849,19 @@ export function buildFileLintMap(files: WikiFile[]): Map<string, FileLint> {
 
 export function resolveFileByLink(index: WikiLinkIndex, target: string, source?: WikiFile): WikiFile | undefined {
   const clean = cleanTarget(target).toLowerCase();
-  const matches = index.get(clean) || [];
-  return matches.find((file) => file.vaultId === source?.vaultId) ?? matches[0];
+  // Try, in order: the exact cleaned target, the same with leading ./ ../ stripped
+  // (path-relative links like [[../la-chaine-brain]] or [[../../team-brain/...]]),
+  // and finally the basename. The link index holds every path suffix + the basename,
+  // so this resolves relative and cross-brain links instead of leaving ghost nodes.
+  const withoutDotDot = clean.replace(/^(?:\.\.?\/)+/, '');
+  const basename = withoutDotDot.split('/').filter(Boolean).pop() || withoutDotDot;
+  for (const key of [clean, withoutDotDot, basename]) {
+    const matches = index.get(key);
+    if (matches && matches.length > 0) {
+      return matches.find((file) => file.vaultId === source?.vaultId) ?? matches[0];
+    }
+  }
+  return undefined;
 }
 
 function slugForWiki(vaultName: string): string {
