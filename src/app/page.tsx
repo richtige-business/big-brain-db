@@ -905,10 +905,16 @@ function GraphView({
 
   const focusedFromNode = useMemo(() => {
     if (!hoverId || !neighbors.has(hoverId)) return null;
+    // Hovering the Big Brain (or the vault root that sits with it) activates the
+    // WHOLE brain — every node + relation lights up.
+    const node = layout.nodes.get(hoverId);
+    if (hoverId === BRAIN_NODE_ID || (node?.subBrain && !hoverId.startsWith('subbrain:'))) {
+      return new Set<string>(layout.nodes.keys());
+    }
     const set = new Set<string>([hoverId]);
     for (const n of neighbors.get(hoverId) || []) set.add(n);
     return set;
-  }, [hoverId, neighbors]);
+  }, [hoverId, neighbors, layout.nodes]);
 
   const nodeIdSet = useMemo(() => new Set(Array.from(layout.nodes.keys())), [layout.nodes]);
   const activeFocusScope = hoverScope ?? (graphScope.type === 'all' ? null : graphScope);
@@ -925,6 +931,9 @@ function GraphView({
 
     if (activeFocusScope.type === 'vault') {
       const set = new Set<string>();
+      // Whole brain active: the Big Brain root + every sub-brain node + the vault's files.
+      set.add(BRAIN_NODE_ID);
+      for (const id of nodeIdSet) if (id.startsWith('subbrain:')) set.add(id);
       const brainNodeId = `brain:vault:${activeFocusScope.vaultId}`;
       if (nodeIdSet.has(brainNodeId)) set.add(brainNodeId);
       for (const file of flatFiles) {
@@ -2248,7 +2257,18 @@ function WikiSidebar({
       </div>
       <div className="brainMenu">
         <div className="brainMenuHeader">
-          <button className="wikiBrainHeader" type="button" onClick={onBrain} onMouseEnter={onClearHover}>
+          <button
+            className="wikiBrainHeader"
+            type="button"
+            onClick={onBrain}
+            onMouseEnter={() => {
+              // Hovering BIG BRAIN activates the whole brain (every vault's nodes).
+              const first = vaults[0];
+              if (first) onHoverScope({ type: 'vault', vaultId: first.id });
+              else onClearHover();
+            }}
+            onMouseLeave={onClearHover}
+          >
             Big Brain
           </button>
           <button
