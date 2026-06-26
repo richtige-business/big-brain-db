@@ -80,8 +80,11 @@ import {
   getStoredBrainColors,
   setStoredBrainColor,
   getActorBrainRole,
+  getVaultContentCache,
   getWikiVaultHandles,
   hasVaultPermission,
+  reconstructVaultFromCache,
+  saveVaultContentCache,
   isRedundantSignatureProperty,
   isBrainHomeFile,
   isBrainMetaFile,
@@ -119,6 +122,11 @@ import { useWikiSearch } from '@/hooks/useWikiSearch';
 import { PropertiesBlock } from '@/components/PropertiesBlock';
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false });
+// 3D "brain" view (Three.js) — client-only; heavy, so load on demand.
+const BrainView = dynamic(() => import('@/components/BrainView'), {
+  ssr: false,
+  loading: () => <div className="empty"><div><h2>Loading brain…</h2></div></div>,
+});
 
 declare global {
   interface Window {
@@ -804,6 +812,284 @@ function buildSchemaFlow(
   return { nodes: [...tableNodes, ...rawNodes], edges: [...fkEdges, ...rawEdges] };
 }
 
+// Global header search: find documents / brains across all vaults. Selecting a hit
+// sets the preview node, which lights up in BOTH the graph and the brain view (and
+// switches away from the editor so the highlight is visible).
+function HeaderSearch() {
+  const flatFiles = useWikiStore((state) => state.flatFiles);
+  const setGraphPreview = useWikiStore((state) => state.setGraphPreview);
+  const activeView = useWikiStore((state) => state.activeView);
+  const setActiveView = useWikiStore((state) => state.setActiveView);
+  const runSearch = useWikiSearch(flatFiles);
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const results = useMemo(
+    () => runSearch({ query, mode: 'agent', limit: 12, includeNeighbors: 1 }).hits,
+    [runSearch, query],
+  );
+
+  const select = (fileId: string) => {
+    setGraphPreview(fileId);
+    if (activeView === 'editor') setActiveView('graph'); // make the highlight visible
+    setQuery('');
+    setOpen(false);
+  };
+
+  return (
+    <div className="headerSearch">
+      <label className="headerSearchBox">
+        <Search size={14} />
+        <input
+          value={query}
+          placeholder="Search documents, brains…"
+          onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => window.setTimeout(() => setOpen(false), 150)}
+        />
+      </label>
+      {open && query.trim() && (
+        <div className="headerSearchResults">
+          {results.length === 0 ? (
+            <div className="headerSearchMeta">No matches</div>
+          ) : (
+            results.map((hit) => (
+              <button
+                key={hit.fileId}
+                type="button"
+                onMouseDown={(event) => { event.preventDefault(); select(hit.fileId); }}
+              >
+                <strong>{hit.title}</strong>
+                <span>{hit.vaultName} / {hit.path}</span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Container for the 3D "brain" view: builds the SAME graph + per-brain colours as
+// GraphView, then hands the real nodes/edges to the Three.js BrainView. Supports the
+// markdown/database/hybrid filter, sidebar/scope hover highlight, and click→preview
+// (the previewed node also lights up — same `previewFileId` signal Graph view uses).
+function BrainGraph({ colorTick, onOpenEditor }: { colorTick: number; onOpenEditor: (fileId: string) => void }) {
+  const flatFiles = useWikiStore((state) => state.flatFiles);
+  const vaults = useWikiStore((state) => state.vaults);
+  const hoverScope = useWikiStore((state) => state.hoverScope);
+  const graphScope = useWikiStore((state) => state.graphScope);
+  const previewFileId = useWikiStore((state) => state.graphPreviewId);
+  const setGraphPreview = useWikiStore((state) => state.setGraphPreview);
+
+  const [graphMode, setGraphMode] = useState<GraphFilterMode>('markdown');
+  const [schemaGraph, setSchemaGraph] = useState<SchemaGraphPayload | null>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (graphMode === 'markdown' || schemaGraph) return;
+    let cancelled = false;
+    fetch('/api/brain/schema-graph')
+      .then((response) => response.json())
+      .then((payload) => {
+        if (cancelled) return;
+        if (payload?.success) {
+          setSchemaGraph(payload as SchemaGraphPayload);
+          setSchemaError(null);
+        } else {
+          setSchemaError(payload?.message || 'Schema graph unavailable. Configure Supabase to enable the database layer.');
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setSchemaError(error instanceof Error ? error.message : 'Schema graph request failed.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [graphMode, schemaGraph]);
+
+  const layout = useMemo(() => {
+    const graph = buildGraph(flatFiles);
+    return computeLayout(graph.nodes, graph.edges);
+  }, [flatFiles]);
+
+  const neighbors = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const edge of layout.edges) {
+      if (!map.has(edge.source)) map.set(edge.source, new Set());
+      if (!map.has(edge.target)) map.set(edge.target, new Set());
+      map.get(edge.source)!.add(edge.target);
+      map.get(edge.target)!.add(edge.source);
+    }
+    return map;
+  }, [layout.edges]);
+
+  const vaultColorMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const vault of vaults) map.set(vault.id, getVaultColor(vault));
+    return map;
+  }, [vaults]);
+
+  // Per-node markdown colours + an owner-scope→colour map (basename / 'brain') reused
+  // to colour the database layer by its owning brain.
+  const { mdNodes, mdEdges, ownerColor } = useMemo(() => {
+    void colorTick; // recompute when a brain colour changes
+    const stored = getStoredBrainColors();
+    const colorOf = new Map<string, string>();
+    const owner = new Map<string, string>();
+    for (const [id, n] of layout.nodes) {
+      if (id.startsWith('subbrain:')) {
+        const path = id.slice('subbrain:'.length);
+        const c = stored[path] ?? (n.vaultId ? vaultColorMap.get(n.vaultId) : undefined);
+        if (c) {
+          colorOf.set(id, c);
+          const base = path.split('/').filter(Boolean).pop();
+          if (base) owner.set(base, c);
+        }
+      } else if (n.subBrain || n.brain) {
+        const c = n.vaultId ? stored[n.vaultId] ?? vaultColorMap.get(n.vaultId) : undefined;
+        if (c) {
+          colorOf.set(id, c);
+          if (n.brain) owner.set('brain', c); // BRAIN_OWNER_ID
+        }
+      }
+    }
+    for (const e of layout.edges) {
+      if (e.brainAnchor && e.source.startsWith('subbrain:')) {
+        const c = colorOf.get(e.source);
+        if (c && !colorOf.has(e.target)) colorOf.set(e.target, c);
+      }
+    }
+    const outNodes = [...layout.nodes].map(([id, n]) => ({
+      id,
+      title: n.title,
+      weight: n.weight,
+      color: colorOf.get(id) ?? (n.vaultId ? vaultColorMap.get(n.vaultId) : undefined) ?? '#9aa0a6',
+    }));
+    const outEdges = layout.edges.map((e) => ({ source: e.source, target: e.target }));
+    return { mdNodes: outNodes, mdEdges: outEdges, ownerColor: owner };
+  }, [layout, vaultColorMap, colorTick]);
+
+  // Database layer: tables + raw sources as nodes, FK + raw relations as edges,
+  // coloured by owning brain (fallback slate) so the layers stay visually distinct.
+  const { dbNodes, dbEdges } = useMemo(() => {
+    if (!schemaGraph) return { dbNodes: [] as typeof mdNodes, dbEdges: [] as typeof mdEdges };
+    const DB_FALLBACK = '#7c8aa0';
+    const colour = (ownerId: string | null) => (ownerId && ownerColor.get(ownerId)) || DB_FALLBACK;
+    const tableNodes = schemaGraph.tables.map((t) => ({ id: t.id, title: t.label, weight: 1, color: colour(t.agentOwnerId) }));
+    const rawNodes = schemaGraph.rawSources.map((s) => ({ id: s.id, title: s.label, weight: 1, color: colour(s.agentOwnerId) }));
+    const fkEdges = schemaGraph.relations.map((r) => ({ source: r.sourceTableId, target: r.targetTableId }));
+    const tableIds = new Set(schemaGraph.tables.map((t) => t.id));
+    const rawEdges = schemaGraph.rawSources.flatMap((s) =>
+      s.relatedTableIds.filter((id) => tableIds.has(id)).map((id) => ({ source: s.id, target: id })),
+    );
+    return { dbNodes: [...tableNodes, ...rawNodes], dbEdges: [...fkEdges, ...rawEdges] };
+  }, [schemaGraph, ownerColor]);
+
+  const { nodes, edges } = useMemo(() => {
+    if (graphMode === 'database') return { nodes: dbNodes, edges: dbEdges };
+    if (graphMode === 'hybrid') return { nodes: [...mdNodes, ...dbNodes], edges: [...mdEdges, ...dbEdges] };
+    return { nodes: mdNodes, edges: mdEdges };
+  }, [graphMode, mdNodes, mdEdges, dbNodes, dbEdges]);
+
+  // Highlight set: sidebar hover / locked scope (same as Graph view), and — when
+  // nothing else is focused — the clicked/searched preview node (+ its neighbours).
+  const focusedIds = useMemo(() => {
+    const nodeIdSet = new Set(layout.nodes.keys());
+    const scope = hoverScope ?? (graphScope.type === 'all' ? null : graphScope);
+    if (!scope) {
+      if (previewFileId && nodeIdSet.has(previewFileId)) {
+        const set = new Set<string>([previewFileId]);
+        for (const n of neighbors.get(previewFileId) || []) set.add(n);
+        return set;
+      }
+      return null;
+    }
+    if (scope.type === 'file') {
+      if (!nodeIdSet.has(scope.fileId)) return null;
+      const set = new Set<string>([scope.fileId]);
+      for (const n of neighbors.get(scope.fileId) || []) set.add(n);
+      return set;
+    }
+    if (scope.type === 'vault') {
+      const set = new Set<string>();
+      set.add(BRAIN_NODE_ID);
+      for (const id of nodeIdSet) if (id.startsWith('subbrain:')) set.add(id);
+      const brainNodeId = `brain:vault:${scope.vaultId}`;
+      if (nodeIdSet.has(brainNodeId)) set.add(brainNodeId);
+      for (const file of flatFiles) {
+        if (file.vaultId !== scope.vaultId) continue;
+        if (nodeIdSet.has(file.id)) set.add(file.id);
+      }
+      return set.size > 0 ? set : null;
+    }
+    const set = new Set<string>();
+    for (const file of flatFiles) {
+      if (file.vaultId !== scope.vaultId) continue;
+      if (!fileInFolderPath(file, scope.folderPath)) continue;
+      if (nodeIdSet.has(file.id)) set.add(file.id);
+    }
+    return set.size > 0 ? set : null;
+  }, [hoverScope, graphScope, previewFileId, layout.nodes, neighbors, flatFiles]);
+
+  // Preview panel data (same as Graph view).
+  const previewFile =
+    previewFileId && previewFileId !== BRAIN_NODE_ID && !isVaultBrainNodeId(previewFileId)
+      ? flatFiles.find((file) => file.id === previewFileId) || null
+      : null;
+  const previewVault = previewFileId && isVaultBrainNodeId(previewFileId)
+    ? vaults.find((vault) => vault.id === vaultIdFromBrainNodeId(previewFileId)) ?? null
+    : null;
+  const brainMetaFiles = useMemo(() => flatFiles.filter(isBrainMetaFile), [flatFiles]);
+  const brainHomeFiles = useMemo(() => brainMetaFiles.filter(isBrainHomeFile), [brainMetaFiles]);
+
+  if (mdNodes.length === 0 && dbNodes.length === 0) {
+    return (
+      <div className="empty">
+        <div>
+          <h2>No brain to show</h2>
+          <p>Add a brain to populate the 3D view.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`graphCanvas brainCanvas ${focusedIds ? 'is-hovering' : ''} ${previewFileId ? 'has-preview' : ''}`}>
+      <div className="graphModePanel">
+        {(['markdown', 'database', 'hybrid'] as GraphFilterMode[]).map((mode) => (
+          <button key={mode} type="button" className={graphMode === mode ? 'is-active' : ''} onClick={() => setGraphMode(mode)}>
+            {mode}
+          </button>
+        ))}
+        {schemaError && graphMode !== 'markdown' ? (
+          <span className="graphModePanel__error" title={schemaError}>DB layer unavailable</span>
+        ) : null}
+      </div>
+      <BrainView nodes={nodes} edges={edges} focusedIds={focusedIds} onNodeClick={(id) => setGraphPreview(id)} />
+      {previewFile && (
+        <GraphPreviewPanel file={previewFile} onClose={() => setGraphPreview(null)} onOpenEditor={() => onOpenEditor(previewFile.id)} />
+      )}
+      {!previewFile && previewFileId === BRAIN_NODE_ID && (
+        <BrainMapPanel
+          vaults={vaults}
+          files={brainHomeFiles}
+          onClose={() => setGraphPreview(null)}
+          onOpenFile={(fileId) => { setGraphPreview(null); onOpenEditor(fileId); }}
+        />
+      )}
+      {!previewFile && previewVault && (
+        <SubBrainPanel
+          vault={previewVault}
+          homeFile={brainHomeFileMap(brainHomeFiles).get(previewVault.id) ?? null}
+          metaFiles={brainMetaFiles.filter((file) => file.vaultId === previewVault.id)}
+          onClose={() => setGraphPreview(null)}
+          onOpenFile={(fileId) => { setGraphPreview(null); onOpenEditor(fileId); }}
+        />
+      )}
+    </div>
+  );
+}
+
 function GraphView({
   onClearSelections,
   onOpenEditor,
@@ -952,8 +1238,23 @@ function GraphView({
     return set.size > 0 ? set : null;
   }, [activeFocusScope, flatFiles, neighbors, nodeIdSet]);
 
-  const focusedSet = hoverId ? focusedFromNode : focusedFromScope;
-  const hoverKind: HoverState['hoverKind'] = hoverId ? 'node' : focusedFromScope ? (lockedFocusActive ? 'lock' : 'scope') : null;
+  // When nothing else is focused, the clicked/searched preview node (+ neighbours)
+  // lights up — so a header-search selection glows in the graph just like in the brain.
+  const focusedFromPreview = useMemo(() => {
+    if (!previewFileId || !nodeIdSet.has(previewFileId)) return null;
+    const set = new Set<string>([previewFileId]);
+    for (const n of neighbors.get(previewFileId) || []) set.add(n);
+    return set;
+  }, [previewFileId, nodeIdSet, neighbors]);
+
+  const focusedSet = hoverId ? focusedFromNode : (focusedFromScope ?? focusedFromPreview);
+  const hoverKind: HoverState['hoverKind'] = hoverId
+    ? 'node'
+    : focusedFromScope
+      ? (lockedFocusActive ? 'lock' : 'scope')
+      : focusedFromPreview
+        ? 'scope'
+        : null;
 
   const searchResponse = useMemo(
     () => runSearch({ query: searchQuery, mode: 'agent', limit: 20, includeNeighbors: 1 }),
@@ -2583,9 +2884,9 @@ export default function Home() {
     async function restoreStoredVaults() {
       try {
         const storedVaults = await getWikiVaultHandles();
-        // #region agent log
-        fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'pre-fix-3',hypothesisId:'H8',location:'src/app/page.tsx:restoreStoredVaults.afterReadHandles',message:'Stored Brain handles read during restore',data:{storedCount:storedVaults.length,currentVaultCount:useWikiStore.getState().vaults.length,cancelled},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
+        if (cancelled) return;
+        const contentCache = await getVaultContentCache();
+        const cacheById = new Map(contentCache.map((entry) => [entry.id, entry]));
         if (cancelled) return;
 
         const loadedVaults: WikiVault[] = [];
@@ -2595,9 +2896,15 @@ export default function Home() {
             if (await hasVaultPermission(stored.handle, false, 'read')) {
               loadedVaults.push(await loadStoredVault(stored, false));
             } else {
+              // No live permission yet — show the Brain immediately from the durable
+              // content cache (so it's NEVER gone), and queue a silent live upgrade.
+              const cached = cacheById.get(stored.id);
+              if (cached) loadedVaults.push(reconstructVaultFromCache(stored.handle, cached));
               needsReconnect.push(stored);
             }
           } catch {
+            const cached = cacheById.get(stored.id);
+            if (cached) loadedVaults.push(reconstructVaultFromCache(stored.handle, cached));
             needsReconnect.push(stored);
           }
         }
@@ -2608,12 +2915,6 @@ export default function Home() {
             ...currentVaults,
             ...loadedVaults.filter((loaded) => !currentVaults.some((current) => current.id === loaded.id)),
           ];
-          // #region agent log
-          fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'pre-fix-3',hypothesisId:'H8',location:'src/app/page.tsx:restoreStoredVaults.beforeSetVaults',message:'Restore is about to replace store vaults',data:{loadedCount:loadedVaults.length,currentVaultCount:useWikiStore.getState().vaults.length,needsReconnectCount:needsReconnect.length},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
-          // #region agent log
-          fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'post-fix-1',hypothesisId:'H8',location:'src/app/page.tsx:restoreStoredVaults.beforeMergeSetVaults',message:'Restore will merge with current store instead of replacing it',data:{loadedCount:loadedVaults.length,currentVaultCount:currentVaults.length,mergedCount:mergedVaults.length,needsReconnectCount:needsReconnect.length},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
           setVaults(mergedVaults, useWikiStore.getState().activeVaultId ?? loadedVaults[0].id);
         }
         if (!cancelled) {
@@ -2622,9 +2923,6 @@ export default function Home() {
       } catch (err) {
         if (!cancelled) setError((err as Error).message || 'Saved Brains could not be loaded.');
       } finally {
-        // #region agent log
-        fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'pre-fix-3',hypothesisId:'H8',location:'src/app/page.tsx:restoreStoredVaults.finally',message:'Restore finished',data:{cancelled,currentVaultCount:useWikiStore.getState().vaults.length},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         if (!cancelled) setRestoringVault(false);
       }
     }
@@ -2634,6 +2932,14 @@ export default function Home() {
       cancelled = true;
     };
   }, [loadStoredVault, setVaults]);
+
+  // Keep the durable content cache fresh: whenever vaults/their contents change,
+  // snapshot them to IndexedDB so a reload can always rebuild the Brain even if the
+  // browser drops the folder permission. (Best-effort; never blocks the UI.)
+  useEffect(() => {
+    if (vaults.length === 0) return;
+    void saveVaultContentCache(vaults);
+  }, [vaults]);
 
   const openVault = async (options?: { vaultId?: string; vaultName?: string }) => {
     // #region agent log
@@ -3279,6 +3585,7 @@ export default function Home() {
           </div>
         </div>
         <div className="topActions">
+          <HeaderSearch />
           <div className="viewToggle">
             <button className={activeView === 'editor' ? 'active' : ''} onClick={() => setActiveView('editor')}>
               <Pencil size={14} />
@@ -3287,6 +3594,10 @@ export default function Home() {
             <button className={activeView === 'graph' ? 'active' : ''} onClick={() => setActiveView('graph')}>
               <Network size={14} />
               Graph
+            </button>
+            <button className={activeView === 'brain' ? 'active' : ''} onClick={() => setActiveView('brain')}>
+              <Brain size={14} />
+              Brain
             </button>
           </div>
           <button className="ghost" onClick={saveCurrent} disabled={!selectedFile || !selectedFile.dirty || !canEditSelected}>
@@ -3358,7 +3669,9 @@ export default function Home() {
         </aside>
 
         <main className="content">
-          {activeView === 'graph' ? (
+          {activeView === 'brain' ? (
+            <BrainGraph colorTick={brainColorTick} onOpenEditor={openEditorFromGraph} />
+          ) : activeView === 'graph' ? (
             <GraphView onClearSelections={clearAllSelections} onOpenEditor={openEditorFromGraph} colorTick={brainColorTick} />
           ) : selectedFile && parsed ? (
             <div className="editorLayout">

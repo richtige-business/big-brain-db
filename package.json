@@ -17,6 +17,7 @@
     "@monaco-editor/react": "latest",
     "@supabase/supabase-js": "^2.105.1",
     "@types/d3-force": "^3.0.10",
+    "@types/three": "^0.160.0",
     "@xyflow/react": "latest",
     "d3-force": "^3.0.0",
     "lucide-react": "latest",
@@ -26,6 +27,8 @@
     "react-dom": "latest",
     "react-markdown": "latest",
     "remark-gfm": "latest",
+    "simplex-noise": "^4.0.1",
+    "three": "^0.160.0",
     "zod": "^4.4.1",
     "zustand": "latest"
   },

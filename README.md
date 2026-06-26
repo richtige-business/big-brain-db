@@ -2,6 +2,8 @@
 
 Big Brain DB is an agent-first Markdown brain database. It is a local-first knowledge app for folders of Markdown files, with graph navigation, Brain anchors, collaboration primitives, change history, conflict detection, and a local MCP server so agents such as Claude Code and Cursor can read, search, lint, and maintain Brains.
 
+It also ships an optional **server layer** (Supabase/PostgreSQL) that adds scope-based brain spaces, server-persisted brain documents, a hybrid graph that renders the database schema alongside the markdown wiki, and an agent-brain ingestion service that keeps durable knowledge in sync. The server layer is opt-in: without Supabase configured, Big Brain DB stays fully local-first.
+
 The product is inspired by the personal-wiki and context-engineering style popularized by **Andrej Karpathy**. Big Brain DB is not affiliated with or endorsed by him; the reference is an acknowledgement of the idea that a durable, well-linked knowledge base can become a high-leverage context layer for humans and agents.
 
 ## What Big Brain DB Is
@@ -26,7 +28,10 @@ The app is designed for three users at once:
 - Local collaboration state with actors, memberships, invite codes, roles, change events, versions, baselines, and conflicts.
 - Supabase-backed invite persistence when configured.
 - Local in-memory invite fallback for development.
-- MCP server for Claude Code, Cursor, and other MCP clients.
+- MCP server for Claude Code, Cursor, and other MCP clients, with content-hash change detection (unchanged writes are skipped) and automatic document-type inference.
+- Optional server layer: scope-based brain spaces (`user`, `base`, `group`, `agent`, `council`), server-persisted brain documents with audit trail, and wiki-link relations.
+- Hybrid graph filter (`markdown` / `database` / `hybrid`) that renders the brain schema (tables, foreign keys, raw sources) next to the markdown graph, behind an anatomical brain silhouette.
+- Agent-brain ingestion that auto-generates and refreshes durable-knowledge scaffolding pages with stable-diff change detection.
 
 ## Project Status
 
@@ -168,6 +173,51 @@ create index if not exists brain_invites_brain_id_idx on brain_invites(brain_id)
 
 The app currently uses a service role key in server routes. Before production deployment, add proper auth, row-level security, ownership checks, invite expiration, and audit logging.
 
+The full, current schema — including the server-layer brain tables described below — lives in [`supabase/schema.sql`](supabase/schema.sql). Run that file in the Supabase SQL editor to provision everything at once.
+
+## Server Layer (Hybrid Brain)
+
+The server layer is optional and activates only when Supabase is configured. It mirrors the brain module that ships inside Connect, adapted from Prisma to the Supabase service client.
+
+### Data model
+
+`supabase/schema.sql` adds six tables:
+
+- `brain_spaces` — scope-based knowledge containers (`user`, `base`, `group`, `agent`, `council`), unique per `(user_id, scope_type, scope_id)`.
+- `brain_documents` — human-readable markdown documents with frontmatter, tags, content hash, and actor audit fields, unique per `(space_id, slug)`.
+- `brain_sources` — provenance for imported/ingested content.
+- `brain_entities` — normalized entity nodes (people, orgs, concepts).
+- `brain_relations` — graph edges, including `wiki_link` relations derived automatically from `[[links]]` on every document write.
+- `brain_change_events` — append-only audit log of create/update actions.
+
+PostgreSQL is the operational source of truth; the markdown documents remain the durable, human-readable layer.
+
+### API routes
+
+| Route | Purpose |
+| --- | --- |
+| `GET/POST /api/brain` | Read documents by scope, or upsert a space/document. |
+| `GET/PATCH /api/brain/[documentId]` | Read or update a single document. |
+| `GET /api/brain/schema-graph` | Hybrid-graph payload: tables, foreign keys, raw sources, ownership. |
+| `POST /api/brain/import` | Import markdown files into a scoped space (frontmatter + type inference). |
+| `GET/POST /api/brain/agents/ensure` | Ensure agent brain spaces and refresh their scaffolding pages. |
+
+All routes operate under a single local user (`local-user`) and degrade gracefully: if Supabase is not configured they return a `*_FAILED` error rather than crashing the local-first app.
+
+### Hybrid graph
+
+The graph view has a `markdown` / `database` / `hybrid` toggle (top-right of the canvas):
+
+- `markdown` — the original local wiki-link graph (default; unchanged behaviour).
+- `database` — the brain schema graph from `/api/brain/schema-graph`.
+- `hybrid` — both, side by side.
+
+An anatomical brain silhouette is rendered faintly behind the graph in every mode.
+
+### Agent-brain ingestion
+
+`syncAgentBrainKnowledgeSpaces` (exposed via `/api/brain/agents/ensure`) creates an `agent`-scoped space per profile and generates the standard durable-knowledge pages — `AGENT_START`, `log`, dataset inventory, projection policy, and ingestion gaps. A stable-diff check means unchanged pages are never rewritten. The built-in `brain` profile reflects the brain's own tables (counts and recent rows).
+
 ## No Supabase Data In This Repository
 
 This repository should contain only placeholders such as `.env.local.example`. Real values belong in local environment files or deployment secrets.
@@ -270,7 +320,12 @@ The MCP server can:
 - append to `log.md`
 - ingest pasted text
 
-The server only reads and writes below the configured `--vault` path. It rejects path traversal with `..`.
+Writes go through canonical actor stamping with two ports from the Connect brain module:
+
+- **Document-type inference** — when a note has no explicit `type` in frontmatter, the type is inferred from its path (`sources/` → `source`, `*-brain.md` → `brain`, `AGENT_START.md` → `agent-start`, and so on).
+- **Change detection** — overwriting a note with unchanged meaningful content (body + non-volatile frontmatter) is skipped and returns `skipped: true`, so repeated/idempotent ingests don't churn timestamps or history.
+
+The server only reads and writes below the configured `--vault` path. It rejects path traversal with `..`. The MCP server is local and file-based; the database schema graph is exposed through the web API (`/api/brain/schema-graph`), not the stdio MCP.
 
 ## Claude Code MCP Connection
 

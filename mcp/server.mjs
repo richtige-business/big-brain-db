@@ -259,7 +259,18 @@ function createVault(context) {
         ? `${await fs.readFile(note.absolute, 'utf8')}${content.startsWith('\n') ? '' : '\n'}${content}`
         : content;
 
-    const stamped = options.stamp === false ? nextContent : stampContent(nextContent, context, options.summary);
+    // Change detection: for overwrite/create on an existing note, skip the
+    // write entirely when the meaningful content is unchanged. Avoids stamp
+    // churn and lets agents safely re-run idempotent ingests.
+    if (alreadyExists && options.mode !== 'append') {
+      const existingRaw = await fs.readFile(note.absolute, 'utf8');
+      if (stableSignature(existingRaw) === stableSignature(nextContent)) {
+        const current = await readNote(note.relative);
+        return { ...current, skipped: true, reason: 'unchanged' };
+      }
+    }
+
+    const stamped = options.stamp === false ? nextContent : stampContent(nextContent, context, options.summary, note.relative);
     await fs.writeFile(note.absolute, stamped, 'utf8');
     return readNote(note.relative);
   }
@@ -274,7 +285,7 @@ function createVault(context) {
       throw new Error(`Text occurs ${occurrences} times. Pass replaceAll=true or use a more specific oldText.`);
     }
     const replaced = options.replaceAll ? note.content.split(oldText).join(newText) : note.content.replace(oldText, newText);
-    const stamped = options.stamp === false ? replaced : stampContent(replaced, context, options.summary || 'Patched note');
+    const stamped = options.stamp === false ? replaced : stampContent(replaced, context, options.summary || 'Patched note', note.path);
     await fs.writeFile(resolveInside(note.path), stamped, 'utf8');
     return {
       note: await readNote(note.path),
@@ -383,7 +394,49 @@ const LEGACY_SIGNATURE_PROPERTIES = new Set([
   'mcp_server',
 ]);
 
-function stampContent(content, context, summary = 'Updated by MCP agent') {
+// Frontmatter keys that change on every write and must be ignored when
+// deciding whether a note's meaningful content actually changed.
+const VOLATILE_PROPERTIES = new Set([
+  'updated_at',
+  'updated_by',
+  'last_change_summary',
+  'created_at',
+  'created_by',
+  'content_hash',
+  'generated_at',
+]);
+
+// Document-type inference (ported from the Connect brain module's
+// detectDocumentType): path-based, with an explicit frontmatter override.
+function docTypeFromPath(relativePath, properties) {
+  const explicit = String(properties?.type || '').trim();
+  if (explicit) return explicit;
+  const p = String(relativePath || '').toLowerCase();
+  if (p.endsWith('agent_start.md')) return 'agent-start';
+  if (p.endsWith('log.md')) return 'log';
+  if (p.includes('/sources/') || p.startsWith('sources/')) return 'source';
+  if (p.includes('/concepts/') || p.startsWith('concepts/')) return 'concept';
+  if (p.includes('/entities/') || p.startsWith('entities/')) return 'entity';
+  if (p.includes('/decisions/') || p.startsWith('decisions/')) return 'decision';
+  if (p.includes('open-question')) return 'open-question';
+  if (p.includes('/syntheses/') || p.startsWith('syntheses/')) return 'synthesis';
+  if (p.endsWith('-brain.md') || p.includes('brain')) return 'brain';
+  return 'note';
+}
+
+// Stable signature of a note's meaningful content (body + non-volatile
+// frontmatter) used for change detection so unchanged writes are skipped.
+function stableSignature(content) {
+  const parsed = parseFrontmatter(content);
+  const props = Object.fromEntries(
+    Object.entries(parsed.properties)
+      .filter(([key]) => !VOLATILE_PROPERTIES.has(key) && !LEGACY_SIGNATURE_PROPERTIES.has(key))
+      .sort(([a], [b]) => a.localeCompare(b)),
+  );
+  return JSON.stringify({ body: parsed.body.trim(), props });
+}
+
+function stampContent(content, context, summary = 'Updated by MCP agent', notePath = '') {
   const parsed = parseFrontmatter(content);
   const now = new Date().toISOString();
   const properties = Object.fromEntries(
@@ -394,6 +447,7 @@ function stampContent(content, context, summary = 'Updated by MCP agent') {
   properties.last_change_summary = summary;
   if (!properties.created_at) properties.created_at = now;
   if (!properties.created_by) properties.created_by = context.actor;
+  if (!properties.type && notePath) properties.type = docTypeFromPath(notePath, properties);
 
   const frontmatter = ['---', ...Object.entries(properties).map(([key, value]) => `${key}: ${formatFrontmatterValue(value)}`), '---', ''].join('\n');
   return `${frontmatter}${parsed.body.replace(/^\n+/, '')}`;
@@ -767,7 +821,7 @@ async function registerTools(server, context) {
   server.registerTool(
     'write_note',
     {
-      description: 'Create, overwrite, or append to a Markdown note. Writes are stamped with canonical Brain actor metadata by default.',
+      description: 'Create, overwrite, or append to a Markdown note. Writes are stamped with canonical Brain actor metadata and an inferred document type by default. Overwrites with unchanged content are skipped (returns skipped:true) to avoid needless churn.',
       inputSchema: {
         path: z.string().min(1),
         content: z.string(),

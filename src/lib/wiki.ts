@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type WikiView = 'editor' | 'graph';
+export type WikiView = 'editor' | 'graph' | 'brain';
 export type EditorMode = 'edit' | 'read';
 export type PropertyType = 'text' | 'number' | 'checkbox' | 'date' | 'datetime' | 'list' | 'tags';
 export type PropertyValue = string | number | boolean | string[] | null;
@@ -1748,6 +1748,7 @@ const DB_VERSION = 2;
 const HANDLE_STORE = 'handles';
 const LAST_VAULT_KEY = 'last-vault';
 const WIKI_VAULTS_KEY = 'wiki-vaults';
+const WIKI_CONTENT_KEY = 'wiki-content-cache';
 const COLLABORATION_STATE_KEY = 'collaboration-state';
 
 export interface StoredWikiVaultHandle {
@@ -1863,6 +1864,105 @@ export async function getWikiVaultHandles(): Promise<StoredWikiVaultHandle[]> {
 export async function clearWikiVaultHandles(): Promise<void> {
   await deleteDbValue(WIKI_VAULTS_KEY);
   await deleteDbValue(LAST_VAULT_KEY);
+  await deleteDbValue(WIKI_CONTENT_KEY);
+}
+
+// ---------------------------------------------------------------------------
+// Durable content cache — so a Brain is NEVER lost on reload, even when the
+// browser drops the File System Access permission. We cache each vault's file
+// contents (no handles) in IndexedDB; on restore without permission we rebuild
+// the full brain from this cache (read-only) and silently upgrade to live on
+// the first user gesture. The on-disk files are always the source of truth.
+// ---------------------------------------------------------------------------
+interface CachedVaultFile {
+  id: string;
+  name: string;
+  path: string;
+  content: string;
+  vaultId: string;
+  vaultName: string;
+}
+export interface CachedVault {
+  id: string;
+  name: string;
+  color?: string;
+  rootName: string;
+  rootPath: string;
+  files: CachedVaultFile[];
+}
+
+export async function saveVaultContentCache(vaults: WikiVault[]): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  const payload: CachedVault[] = vaults.map((vault) => ({
+    id: vault.id,
+    name: vault.name,
+    color: vault.color,
+    rootName: vault.tree.name,
+    rootPath: vault.tree.path,
+    files: vault.flatFiles.map((file) => ({
+      id: file.id,
+      name: file.name,
+      path: file.path,
+      content: file.content,
+      vaultId: file.vaultId,
+      vaultName: file.vaultName,
+    })),
+  }));
+  await writeDbValue<CachedVault[]>(WIKI_CONTENT_KEY, payload);
+}
+
+export async function getVaultContentCache(): Promise<CachedVault[]> {
+  if (typeof indexedDB === 'undefined') return [];
+  return (await readDbValue<CachedVault[]>(WIKI_CONTENT_KEY)) ?? [];
+}
+
+// Rebuild a full WikiVault (tree + flatFiles) from a content cache entry, reusing
+// the still-stored root directory handle (which survives in IndexedDB even without
+// permission). Files/folders carry no live handles → editing needs a reconnect.
+export function reconstructVaultFromCache(rootHandle: FileSystemDirectoryHandle, cached: CachedVault): WikiVault {
+  const vaultId = cached.id;
+  const rootPath = cached.rootPath;
+  const folderMap = new Map<string, WikiFolder>();
+  const root: WikiFolder = {
+    id: `folder:${vaultId}:${rootPath}`,
+    name: cached.rootName,
+    path: rootPath,
+    files: [],
+    folders: [],
+    vaultId,
+  };
+  folderMap.set(rootPath, root);
+
+  function ensureFolder(path: string): WikiFolder {
+    const existing = folderMap.get(path);
+    if (existing) return existing;
+    const name = path.slice(path.lastIndexOf('/') + 1);
+    const folder: WikiFolder = { id: `folder:${vaultId}:${path}`, name, path, files: [], folders: [], vaultId };
+    folderMap.set(path, folder);
+    const parentPath = path.slice(0, path.lastIndexOf('/'));
+    const parent = parentPath && parentPath !== rootPath ? ensureFolder(parentPath) : root;
+    parent.folders.push(folder);
+    return folder;
+  }
+
+  const flat: WikiFile[] = [];
+  for (const f of cached.files) {
+    const file: WikiFile = {
+      id: f.id,
+      name: f.name,
+      path: f.path,
+      content: f.content,
+      dirty: false,
+      vaultId: f.vaultId,
+      vaultName: f.vaultName,
+    };
+    flat.push(file);
+    const folderPath = f.path.slice(0, f.path.lastIndexOf('/'));
+    const folder = !folderPath || folderPath === rootPath ? root : ensureFolder(folderPath);
+    folder.files.push(file);
+  }
+
+  return { id: vaultId, name: cached.name, rootHandle, tree: root, flatFiles: flat, color: cached.color };
 }
 
 export async function saveCollaborationState(snapshot: CollaborationStateSnapshot): Promise<void> {
