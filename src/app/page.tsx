@@ -21,6 +21,12 @@ import {
   type NodeProps,
   type ReactFlowInstance,
 } from '@xyflow/react';
+import type {
+  GraphFilterMode,
+  SchemaGraphPayload,
+  SchemaGraphRawSource,
+  SchemaGraphTable,
+} from '@/lib/brain/schema-graph-types';
 import {
   forceCenter,
   forceCollide,
@@ -35,6 +41,7 @@ import {
 import {
   ArrowLeft,
   BookOpen,
+  Brain,
   ChevronDown,
   ChevronRight,
   FilePlus2,
@@ -63,14 +70,21 @@ import {
   computeWikiFileContentHash,
   createMarkdownFileInDirectory,
   createSubfolderInDirectory,
+  createSubBrainInDirectory,
+  deleteFolderInVault,
   createVaultId,
   extractLinks,
   fileTitle,
   getCollaborationState,
   getVaultColor,
+  getStoredBrainColors,
+  setStoredBrainColor,
   getActorBrainRole,
+  getVaultContentCache,
   getWikiVaultHandles,
   hasVaultPermission,
+  reconstructVaultFromCache,
+  saveVaultContentCache,
   isRedundantSignatureProperty,
   isBrainHomeFile,
   isBrainMetaFile,
@@ -108,6 +122,11 @@ import { useWikiSearch } from '@/hooks/useWikiSearch';
 import { PropertiesBlock } from '@/components/PropertiesBlock';
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false });
+// 3D "brain" view (Three.js) — client-only; heavy, so load on demand.
+const BrainView = dynamic(() => import('@/components/BrainView'), {
+  ssr: false,
+  loading: () => <div className="empty"><div><h2>Loading brain…</h2></div></div>,
+});
 
 declare global {
   interface Window {
@@ -125,9 +144,15 @@ function FolderNode({
   onClearHover,
   onCreateMarkdownInFolder,
   onCreateFolderInFolder,
+  onCreateSubBrainInFolder,
   onSetVaultColor,
+  onSetBrainColor,
+  storedBrainColors,
   onDeleteBrain,
+  onDeleteSubBrain,
   canDeleteBrain,
+  asBrain = false,
+  isVaultRoot = false,
 }: {
   folder: WikiFolder;
   depth: number;
@@ -138,9 +163,18 @@ function FolderNode({
   onClearHover: () => void;
   onCreateMarkdownInFolder: (folder: WikiFolder) => void;
   onCreateFolderInFolder: (folder: WikiFolder) => void;
+  onCreateSubBrainInFolder: (folder: WikiFolder) => void;
   onSetVaultColor: (color: string | undefined) => void;
+  onSetBrainColor: (key: string, color: string | undefined) => void;
+  storedBrainColors: Record<string, string>;
   onDeleteBrain?: () => void;
+  onDeleteSubBrain: (folder: WikiFolder) => void;
   canDeleteBrain?: boolean;
+  // asBrain: render this folder itself as a (sub-)brain even at depth 0 (used when
+  // the sidebar promotes a nested {name}-brain folder to a top-level brain section).
+  asBrain?: boolean;
+  // isVaultRoot: this folder is an actual added vault root (shows vault colour/delete).
+  isVaultRoot?: boolean;
 }) {
   const expanded = useWikiStore((state) => state.expandedFolders.has(folder.id));
   const toggle = useWikiStore((state) => state.toggleFolder);
@@ -154,11 +188,24 @@ function FolderNode({
     (graphScope.type === 'folder' && graphScope.vaultId === folder.vaultId && graphScope.folderPath === folder.path) ||
     (depth === 0 && graphScope.type === 'vault' && graphScope.vaultId === folder.vaultId);
 
+  // A nested folder that holds a `{name}-brain.md` anchor is itself a Sub-Brain:
+  // render it as a brain (brain icon + anchor title), nested under its parent, and
+  // hide the anchor file from the file list (the row represents it). The vault root
+  // (depth 0) is already the Big Brain section, so only nested folders graduate.
+  const brainAnchor = (asBrain || depth > 0) ? brainAnchorOf(folder) : undefined;
+  const isBrainFolder = Boolean(brainAnchor);
+  const displayFiles = brainAnchor ? folder.files.filter((f) => f.id !== brainAnchor.id) : folder.files;
+  const folderLabel = brainAnchor ? fileTitle(brainAnchor) : folder.name;
+  // Per-brain colour key (vault id for the vault root, folder path for sub-brains)
+  // — so every (sub-)brain, nested ones included, can have its own colour.
+  const colorKey = isVaultRoot ? folder.vaultId : folder.path;
+  const brainColor = isBrainFolder ? (storedBrainColors[colorKey] ?? vaultColor) : vaultColor;
+
   return (
     <div className="treeNode">
       <div
-        className={`treeRow folderRow ${isLockedFolder ? 'locked' : ''}`}
-        style={{ paddingLeft }}
+        className={`treeRow folderRow ${isBrainFolder ? 'brainFolderRow' : ''} ${isLockedFolder ? 'locked' : ''}`}
+        style={isBrainFolder ? ({ paddingLeft, ['--brain-color' as string]: brainColor } as React.CSSProperties) : { paddingLeft }}
         onMouseEnter={() => onHoverScope({ type: 'folder', vaultId: folder.vaultId, folderPath: folder.path })}
         onMouseLeave={onClearHover}
       >
@@ -168,10 +215,10 @@ function FolderNode({
         <button
           type="button"
           className="folderMain"
-          onClick={() => onFolderCluster(folder)}
+          onClick={() => (brainAnchor ? selectFile(brainAnchor.id) : onFolderCluster(folder))}
         >
-          <FolderOpen size={14} />
-          <span>{folder.name}</span>
+          {isBrainFolder ? <Brain size={14} /> : <FolderOpen size={14} />}
+          <span>{folderLabel}</span>
         </button>
         <div className="folderActions">
           <button
@@ -198,14 +245,26 @@ function FolderNode({
           >
             <FolderPlus size={13} />
           </button>
-          {depth === 0 && (
+          <button
+            type="button"
+            className="folderActionIcon"
+            title="New Sub-Brain"
+            aria-label="New Sub-Brain"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCreateSubBrainInFolder(folder);
+            }}
+          >
+            <Brain size={13} />
+          </button>
+          {(isVaultRoot || isBrainFolder) && (
             <div className="colorPickerWrapper">
               <button
                 type="button"
                 className="folderActionIcon"
                 title="Brain colour"
                 aria-label="Set Brain colour"
-                style={{ color: vaultColor }}
+                style={{ color: brainColor }}
                 onClick={(event) => {
                   event.stopPropagation();
                   setColorPickerOpen((open) => !open);
@@ -214,20 +273,18 @@ function FolderNode({
                 <Palette size={13} />
               </button>
               {colorPickerOpen && (
-                <div
-                  className="colorSwatchMenu"
-                  onClick={(e) => e.stopPropagation()}
-                >
+                <div className="colorSwatchMenu" onClick={(e) => e.stopPropagation()}>
                   {VAULT_PALETTE.map((swatch) => (
                     <button
                       key={swatch}
                       type="button"
-                      className={`colorSwatch ${swatch === vaultColor ? 'active' : ''}`}
+                      className={`colorSwatch ${swatch === brainColor ? 'active' : ''}`}
                       style={{ background: swatch }}
                       title={swatch}
                       aria-label={`Set colour ${swatch}`}
                       onClick={() => {
-                        onSetVaultColor(swatch);
+                        onSetBrainColor(colorKey, swatch);
+                        if (isVaultRoot) onSetVaultColor(swatch);
                         setColorPickerOpen(false);
                       }}
                     />
@@ -236,7 +293,8 @@ function FolderNode({
                     type="button"
                     className="colorSwatchReset"
                     onClick={() => {
-                      onSetVaultColor(undefined);
+                      onSetBrainColor(colorKey, undefined);
+                      if (isVaultRoot) onSetVaultColor(undefined);
                       setColorPickerOpen(false);
                     }}
                   >
@@ -246,7 +304,7 @@ function FolderNode({
               )}
             </div>
           )}
-          {depth === 0 && onDeleteBrain && (
+          {isVaultRoot && onDeleteBrain && (
             <button
               type="button"
               className="folderActionIcon folderActionIcon--danger"
@@ -256,6 +314,20 @@ function FolderNode({
               onClick={(event) => {
                 event.stopPropagation();
                 onDeleteBrain();
+              }}
+            >
+              <Trash2 size={13} />
+            </button>
+          )}
+          {!isVaultRoot && isBrainFolder && (
+            <button
+              type="button"
+              className="folderActionIcon folderActionIcon--danger"
+              title="Delete sub-brain"
+              aria-label="Delete sub-brain"
+              onClick={(event) => {
+                event.stopPropagation();
+                onDeleteSubBrain(folder);
               }}
             >
               <Trash2 size={13} />
@@ -277,10 +349,14 @@ function FolderNode({
               onClearHover={onClearHover}
               onCreateMarkdownInFolder={onCreateMarkdownInFolder}
               onCreateFolderInFolder={onCreateFolderInFolder}
+              onCreateSubBrainInFolder={onCreateSubBrainInFolder}
               onSetVaultColor={onSetVaultColor}
+              onSetBrainColor={onSetBrainColor}
+              storedBrainColors={storedBrainColors}
+              onDeleteSubBrain={onDeleteSubBrain}
             />
           ))}
-          {folder.files.map((file) => {
+          {displayFiles.map((file) => {
             const lint = lintMap.get(file.id);
             return (
               <button
@@ -422,29 +498,77 @@ function computeLayout(rawNodes: GraphNode[], rawEdges: GraphEdge[]): {
   >;
   edges: GraphEdge[];
 } {
-  const vaultIds = Array.from(new Set(rawNodes.map((node) => node.vaultId).filter(Boolean))) as string[];
-  const clusterCenters = computeClusterCenters(vaultIds);
-  const relationCenters = computeRelationCenters(rawNodes, rawEdges, clusterCenters);
+  // Hierarchical radial layout: Big Brain at the centre (0,0); top-level sub-brains
+  // on a ring around it; nested sub-brains clustered around their PARENT sub-brain
+  // (recursively); files cluster around their owning sub-brain.
+  const isSub = (id: string) => id.startsWith('subbrain:');
+  // parent -> child sub-brain edges (from brain-map edges, not file anchors)
+  const childrenOf = new Map<string, string[]>();
+  for (const e of rawEdges) {
+    if (!e.brainMap || e.brainAnchor || !isSub(e.target)) continue;
+    const arr = childrenOf.get(e.source) ?? [];
+    if (!arr.includes(e.target)) arr.push(e.target);
+    childrenOf.set(e.source, arr);
+  }
+  // Centre nodes = Big Brain + the vault node(s); their sub-brain children are top-level.
+  const centerIds = new Set(
+    rawNodes.filter((n) => n.brain || (n.subBrain && !isSub(n.id))).map((n) => n.id),
+  );
+  const topLevel: string[] = [];
+  for (const id of centerIds) for (const c of childrenOf.get(id) ?? []) if (!topLevel.includes(c)) topLevel.push(c);
+
+  const subBrainCenters = new Map<string, { x: number; y: number }>();
+  const place = (id: string, pos: { x: number; y: number }, outwardAngle: number, radius: number, span: number) => {
+    subBrainCenters.set(id, pos);
+    const kids = (childrenOf.get(id) ?? []).filter(isSub);
+    if (kids.length === 0) return;
+    const childRadius = Math.max(240, radius * 0.55);
+    kids.forEach((kid, i) => {
+      const a =
+        kids.length === 1 ? outwardAngle : outwardAngle - span / 2 + ((i + 0.5) / kids.length) * span;
+      place(kid, { x: pos.x + Math.cos(a) * childRadius, y: pos.y + Math.sin(a) * childRadius }, a, childRadius, Math.min(span, Math.PI * 0.8));
+    });
+  };
+  const R1 = Math.max(620, topLevel.length * 160);
+  topLevel.forEach((id, i) => {
+    const a = (i / Math.max(topLevel.length, 1)) * Math.PI * 2 - Math.PI / 2;
+    place(id, { x: Math.cos(a) * R1, y: Math.sin(a) * R1 }, a, R1, Math.PI * 0.6);
+  });
+  const ownerOf = new Map<string, string>();
+  for (const e of rawEdges) if (e.brainAnchor) ownerOf.set(e.target, e.source);
+  const targetCenter = (n: SimNode): { x: number; y: number } => {
+    if (n.brain) return { x: 0, y: 0 };
+    if (n.id.startsWith('subbrain:')) return subBrainCenters.get(n.id) ?? { x: 0, y: 0 };
+    if (n.subBrain) return { x: 0, y: 0 }; // vault node sits with the Big Brain
+    const owner = ownerOf.get(n.id);
+    if (owner && subBrainCenters.has(owner)) return subBrainCenters.get(owner)!;
+    return { x: 0, y: 0 };
+  };
+
   const simNodes: SimNode[] = rawNodes.map((n) => ({
     id: n.id,
     title: n.title,
     weight: n.weight,
     unresolved: n.unresolved,
     vaultId: n.vaultId,
-    communityId: relationCenters.get(n.id)?.communityId,
     brain: n.brain,
     subBrain: n.subBrain,
   }));
 
   for (const node of simNodes) {
     if (node.brain) {
+      // Big Brain at the centre.
       node.fx = 0;
       node.fy = 0;
-    } else if (node.subBrain) {
-      const center = clusterCenters.get(node.vaultId || '');
-      if (center) {
-        node.fx = center.x;
-        node.fy = center.y;
+    } else if (node.subBrain && !node.id.startsWith('subbrain:')) {
+      // The vault node (the "la chaine" big brain) sits at the exact same centre.
+      node.fx = 0;
+      node.fy = 0;
+    } else if (node.id.startsWith('subbrain:')) {
+      const c = subBrainCenters.get(node.id);
+      if (c) {
+        node.fx = c.x;
+        node.fy = c.y;
       }
     }
   }
@@ -469,21 +593,21 @@ function computeLayout(rawNodes: GraphNode[], rawEdges: GraphEdge[]): {
     .force('center', forceCenter(0, 0))
     .force(
       'clusterX',
-      forceX<SimNode>((d) => (d.brain ? 0 : clusterCenters.get(d.vaultId || '')?.x ?? 0)).strength((d) =>
-        d.brain ? 0 : d.subBrain ? 1 : 0.42,
+      forceX<SimNode>((d) => targetCenter(d).x).strength((d) =>
+        d.brain || d.id.startsWith('subbrain:') ? 0 : d.subBrain ? 0.7 : 0.5,
       ),
     )
     .force(
       'clusterY',
-      forceY<SimNode>((d) => (d.brain ? 0 : clusterCenters.get(d.vaultId || '')?.y ?? 0)).strength((d) =>
-        d.brain ? 0 : d.subBrain ? 1 : 0.42,
+      forceY<SimNode>((d) => targetCenter(d).y).strength((d) =>
+        d.brain || d.id.startsWith('subbrain:') ? 0 : d.subBrain ? 0.7 : 0.5,
       ),
     )
-    .force('relationX', forceX<SimNode>((d) => (d.brain || d.subBrain ? 0 : relationCenters.get(d.id)?.x ?? 0)).strength(0.03))
-    .force('relationY', forceY<SimNode>((d) => (d.brain || d.subBrain ? 0 : relationCenters.get(d.id)?.y ?? 0)).strength(0.03))
     .force(
       'collide',
-      forceCollide<SimNode>((d) => 64 + Math.sqrt(d.weight) * 9).strength(0.9),
+      // Hitbox radius: half the rendered NODE_HITBOX plus a gap, scaled a little by
+      // weight. Guarantees node centers stay >= one hitbox apart.
+      forceCollide<SimNode>((d) => NODE_HITBOX / 2 + 8 + Math.sqrt(Math.max(d.weight, 1)) * 9).strength(1),
     )
     .stop();
 
@@ -495,6 +619,15 @@ function computeLayout(rawNodes: GraphNode[], rawEdges: GraphEdge[]): {
         ? 48
         : Math.min(90, Math.max(42, Math.ceil(Math.log(simNodes.length + 1) * 24)));
   for (let i = 0; i < ticks; i++) sim.tick();
+
+  // Final overlap-resolution pass: collision only (no clustering/charge pulling
+  // nodes back together), so no two node hitboxes overlap. Runs until stable or a
+  // hard cap. Nodes are not pinned (no fx/fy), so collide can separate them freely.
+  const collideRadius = (d: SimNode) => NODE_HITBOX / 2 + 8 + Math.sqrt(Math.max(d.weight, 1)) * 9;
+  const relax = forceSimulation<SimNode>(simNodes)
+    .force('collide', forceCollide<SimNode>(collideRadius).strength(1).iterations(4))
+    .stop();
+  for (let i = 0; i < 120; i++) relax.tick();
 
   const rawById = new Map(rawNodes.map((node) => [node.id, node]));
   const nodes = new Map<
@@ -568,15 +701,403 @@ type WikiEdgeData = {
   [key: string]: unknown;
 };
 
-const nodeTypes = { wiki: WikiNodeView };
-const edgeTypes = { wiki: WikiEdgeView };
+type SchemaNodeData = {
+  label: string;
+  kind: 'table' | 'rawSource';
+  detail?: string;
+  ownerName?: string | null;
+  [key: string]: unknown;
+};
+
+function TableNodeView({ data }: NodeProps<Node<SchemaNodeData>>) {
+  return (
+    <div className="schemaNode schemaNode--table" title={data.detail || data.label}>
+      <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
+      <span className="schemaNode__kind">table</span>
+      <span className="schemaNode__label">{data.label}</span>
+      {data.ownerName ? <span className="schemaNode__owner">{data.ownerName}</span> : null}
+      <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
+    </div>
+  );
+}
+
+function RawSourceNodeView({ data }: NodeProps<Node<SchemaNodeData>>) {
+  return (
+    <div className="schemaNode schemaNode--raw" title={data.detail || data.label}>
+      <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
+      <span className="schemaNode__kind">source</span>
+      <span className="schemaNode__label">{data.label}</span>
+      <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
+    </div>
+  );
+}
+
+function SchemaEdgeView({ sourceX, sourceY, targetX, targetY }: EdgeProps) {
+  const [path] = getStraightPath({ sourceX, sourceY, targetX, targetY });
+  return <BaseEdge path={path} style={{ stroke: 'rgba(37,99,235,0.45)', strokeWidth: 1.5, strokeDasharray: '4 4' }} />;
+}
+
+const nodeTypes = { wiki: WikiNodeView, table: TableNodeView, rawSource: RawSourceNodeView };
+const edgeTypes = { wiki: WikiEdgeView, schema: SchemaEdgeView };
+
+// Deterministic side-by-side layout for the database/hybrid graph.
+function buildSchemaFlow(
+  payload: SchemaGraphPayload,
+  // Position of the markdown brain node for a DB owner (scope id), so database
+  // entries sit right at their related markdown node in the hybrid view.
+  ownerPos?: (ownerId: string | null) => { x: number; y: number } | undefined,
+): {
+  nodes: Node<SchemaNodeData>[];
+  edges: Edge[];
+} {
+  const COL_W = 360;
+  const ROW_H = 150;
+  const PER_COL = 4;
+  const ORIGIN_X = 1200; // fallback placement (right of the markdown cluster)
+  const tablePos = new Map<string, { x: number; y: number }>();
+
+  const tableNodes: Node<SchemaNodeData>[] = payload.tables.map((table: SchemaGraphTable, index) => {
+    const x = ORIGIN_X + Math.floor(index / PER_COL) * COL_W;
+    const y = (index % PER_COL) * ROW_H;
+    tablePos.set(table.id, { x, y });
+    return {
+      id: table.id,
+      type: 'table',
+      position: { x, y },
+      data: {
+        label: table.label,
+        kind: 'table',
+        detail: `${table.tableName} · ${table.keyColumns.join(', ')}`,
+        ownerName: table.agentOwnerName,
+      },
+      draggable: true,
+      selectable: false,
+    };
+  });
+
+  const rawColX = ORIGIN_X + (Math.ceil(payload.tables.length / PER_COL) + 1) * COL_W;
+  const rawNodes: Node<SchemaNodeData>[] = payload.rawSources.map((source: SchemaGraphRawSource, index) => {
+    // Co-locate the DB entry with its related markdown brain node (small offset so
+    // both are visible); fall back to the column if there is no matching node.
+    const mp = ownerPos?.(source.agentOwnerId);
+    const position = mp ? { x: mp.x + 36, y: mp.y + 36 } : { x: rawColX, y: index * (ROW_H * 0.8) };
+    return {
+      id: source.id,
+      type: 'rawSource',
+      position,
+      data: { label: source.label, kind: 'rawSource', detail: source.path, ownerName: source.agentOwnerName },
+      draggable: true,
+      selectable: false,
+    };
+  });
+
+  const fkEdges: Edge[] = payload.relations.map((relation) => ({
+    id: relation.id,
+    source: relation.sourceTableId,
+    target: relation.targetTableId,
+    type: 'schema',
+  }));
+
+  const rawEdges: Edge[] = payload.rawSources.flatMap((source) =>
+    source.relatedTableIds
+      .filter((tableId) => tablePos.has(tableId))
+      .map((tableId) => ({
+        id: `raw-edge:${source.id}:${tableId}`,
+        source: source.id,
+        target: tableId,
+        type: 'schema',
+      })),
+  );
+
+  return { nodes: [...tableNodes, ...rawNodes], edges: [...fkEdges, ...rawEdges] };
+}
+
+// Global header search: find documents / brains across all vaults. Selecting a hit
+// sets the preview node, which lights up in BOTH the graph and the brain view (and
+// switches away from the editor so the highlight is visible).
+function HeaderSearch() {
+  const flatFiles = useWikiStore((state) => state.flatFiles);
+  const setGraphPreview = useWikiStore((state) => state.setGraphPreview);
+  const activeView = useWikiStore((state) => state.activeView);
+  const setActiveView = useWikiStore((state) => state.setActiveView);
+  const runSearch = useWikiSearch(flatFiles);
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const results = useMemo(
+    () => runSearch({ query, mode: 'agent', limit: 12, includeNeighbors: 1 }).hits,
+    [runSearch, query],
+  );
+
+  const select = (fileId: string) => {
+    setGraphPreview(fileId);
+    if (activeView === 'editor') setActiveView('graph'); // make the highlight visible
+    setQuery('');
+    setOpen(false);
+  };
+
+  return (
+    <div className="headerSearch">
+      <label className="headerSearchBox">
+        <Search size={14} />
+        <input
+          value={query}
+          placeholder="Search documents, brains…"
+          onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => window.setTimeout(() => setOpen(false), 150)}
+        />
+      </label>
+      {open && query.trim() && (
+        <div className="headerSearchResults">
+          {results.length === 0 ? (
+            <div className="headerSearchMeta">No matches</div>
+          ) : (
+            results.map((hit) => (
+              <button
+                key={hit.fileId}
+                type="button"
+                onMouseDown={(event) => { event.preventDefault(); select(hit.fileId); }}
+              >
+                <strong>{hit.title}</strong>
+                <span>{hit.vaultName} / {hit.path}</span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Container for the 3D "brain" view: builds the SAME graph + per-brain colours as
+// GraphView, then hands the real nodes/edges to the Three.js BrainView. Supports the
+// markdown/database/hybrid filter, sidebar/scope hover highlight, and click→preview
+// (the previewed node also lights up — same `previewFileId` signal Graph view uses).
+function BrainGraph({ colorTick, onOpenEditor }: { colorTick: number; onOpenEditor: (fileId: string) => void }) {
+  const flatFiles = useWikiStore((state) => state.flatFiles);
+  const vaults = useWikiStore((state) => state.vaults);
+  const hoverScope = useWikiStore((state) => state.hoverScope);
+  const graphScope = useWikiStore((state) => state.graphScope);
+  const previewFileId = useWikiStore((state) => state.graphPreviewId);
+  const setGraphPreview = useWikiStore((state) => state.setGraphPreview);
+
+  const [graphMode, setGraphMode] = useState<GraphFilterMode>('markdown');
+  const [schemaGraph, setSchemaGraph] = useState<SchemaGraphPayload | null>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (graphMode === 'markdown' || schemaGraph) return;
+    let cancelled = false;
+    fetch('/api/brain/schema-graph')
+      .then((response) => response.json())
+      .then((payload) => {
+        if (cancelled) return;
+        if (payload?.success) {
+          setSchemaGraph(payload as SchemaGraphPayload);
+          setSchemaError(null);
+        } else {
+          setSchemaError(payload?.message || 'Schema graph unavailable. Configure Supabase to enable the database layer.');
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setSchemaError(error instanceof Error ? error.message : 'Schema graph request failed.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [graphMode, schemaGraph]);
+
+  const layout = useMemo(() => {
+    const graph = buildGraph(flatFiles);
+    return computeLayout(graph.nodes, graph.edges);
+  }, [flatFiles]);
+
+  const neighbors = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const edge of layout.edges) {
+      if (!map.has(edge.source)) map.set(edge.source, new Set());
+      if (!map.has(edge.target)) map.set(edge.target, new Set());
+      map.get(edge.source)!.add(edge.target);
+      map.get(edge.target)!.add(edge.source);
+    }
+    return map;
+  }, [layout.edges]);
+
+  const vaultColorMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const vault of vaults) map.set(vault.id, getVaultColor(vault));
+    return map;
+  }, [vaults]);
+
+  // Per-node markdown colours + an owner-scope→colour map (basename / 'brain') reused
+  // to colour the database layer by its owning brain.
+  const { mdNodes, mdEdges, ownerColor } = useMemo(() => {
+    void colorTick; // recompute when a brain colour changes
+    const stored = getStoredBrainColors();
+    const colorOf = new Map<string, string>();
+    const owner = new Map<string, string>();
+    for (const [id, n] of layout.nodes) {
+      if (id.startsWith('subbrain:')) {
+        const path = id.slice('subbrain:'.length);
+        const c = stored[path] ?? (n.vaultId ? vaultColorMap.get(n.vaultId) : undefined);
+        if (c) {
+          colorOf.set(id, c);
+          const base = path.split('/').filter(Boolean).pop();
+          if (base) owner.set(base, c);
+        }
+      } else if (n.subBrain || n.brain) {
+        const c = n.vaultId ? stored[n.vaultId] ?? vaultColorMap.get(n.vaultId) : undefined;
+        if (c) {
+          colorOf.set(id, c);
+          if (n.brain) owner.set('brain', c); // BRAIN_OWNER_ID
+        }
+      }
+    }
+    for (const e of layout.edges) {
+      if (e.brainAnchor && e.source.startsWith('subbrain:')) {
+        const c = colorOf.get(e.source);
+        if (c && !colorOf.has(e.target)) colorOf.set(e.target, c);
+      }
+    }
+    const outNodes = [...layout.nodes].map(([id, n]) => ({
+      id,
+      title: n.title,
+      weight: n.weight,
+      color: colorOf.get(id) ?? (n.vaultId ? vaultColorMap.get(n.vaultId) : undefined) ?? '#9aa0a6',
+    }));
+    const outEdges = layout.edges.map((e) => ({ source: e.source, target: e.target }));
+    return { mdNodes: outNodes, mdEdges: outEdges, ownerColor: owner };
+  }, [layout, vaultColorMap, colorTick]);
+
+  // Database layer: tables + raw sources as nodes, FK + raw relations as edges,
+  // coloured by owning brain (fallback slate) so the layers stay visually distinct.
+  const { dbNodes, dbEdges } = useMemo(() => {
+    if (!schemaGraph) return { dbNodes: [] as typeof mdNodes, dbEdges: [] as typeof mdEdges };
+    const DB_FALLBACK = '#7c8aa0';
+    const colour = (ownerId: string | null) => (ownerId && ownerColor.get(ownerId)) || DB_FALLBACK;
+    const tableNodes = schemaGraph.tables.map((t) => ({ id: t.id, title: t.label, weight: 1, color: colour(t.agentOwnerId) }));
+    const rawNodes = schemaGraph.rawSources.map((s) => ({ id: s.id, title: s.label, weight: 1, color: colour(s.agentOwnerId) }));
+    const fkEdges = schemaGraph.relations.map((r) => ({ source: r.sourceTableId, target: r.targetTableId }));
+    const tableIds = new Set(schemaGraph.tables.map((t) => t.id));
+    const rawEdges = schemaGraph.rawSources.flatMap((s) =>
+      s.relatedTableIds.filter((id) => tableIds.has(id)).map((id) => ({ source: s.id, target: id })),
+    );
+    return { dbNodes: [...tableNodes, ...rawNodes], dbEdges: [...fkEdges, ...rawEdges] };
+  }, [schemaGraph, ownerColor]);
+
+  const { nodes, edges } = useMemo(() => {
+    if (graphMode === 'database') return { nodes: dbNodes, edges: dbEdges };
+    if (graphMode === 'hybrid') return { nodes: [...mdNodes, ...dbNodes], edges: [...mdEdges, ...dbEdges] };
+    return { nodes: mdNodes, edges: mdEdges };
+  }, [graphMode, mdNodes, mdEdges, dbNodes, dbEdges]);
+
+  // Highlight set: sidebar hover / locked scope (same as Graph view), and — when
+  // nothing else is focused — the clicked/searched preview node (+ its neighbours).
+  const focusedIds = useMemo(() => {
+    const nodeIdSet = new Set(layout.nodes.keys());
+    const scope = hoverScope ?? (graphScope.type === 'all' ? null : graphScope);
+    if (!scope) {
+      if (previewFileId && nodeIdSet.has(previewFileId)) {
+        const set = new Set<string>([previewFileId]);
+        for (const n of neighbors.get(previewFileId) || []) set.add(n);
+        return set;
+      }
+      return null;
+    }
+    if (scope.type === 'file') {
+      if (!nodeIdSet.has(scope.fileId)) return null;
+      const set = new Set<string>([scope.fileId]);
+      for (const n of neighbors.get(scope.fileId) || []) set.add(n);
+      return set;
+    }
+    if (scope.type === 'vault') {
+      const set = new Set<string>();
+      set.add(BRAIN_NODE_ID);
+      for (const id of nodeIdSet) if (id.startsWith('subbrain:')) set.add(id);
+      const brainNodeId = `brain:vault:${scope.vaultId}`;
+      if (nodeIdSet.has(brainNodeId)) set.add(brainNodeId);
+      for (const file of flatFiles) {
+        if (file.vaultId !== scope.vaultId) continue;
+        if (nodeIdSet.has(file.id)) set.add(file.id);
+      }
+      return set.size > 0 ? set : null;
+    }
+    const set = new Set<string>();
+    for (const file of flatFiles) {
+      if (file.vaultId !== scope.vaultId) continue;
+      if (!fileInFolderPath(file, scope.folderPath)) continue;
+      if (nodeIdSet.has(file.id)) set.add(file.id);
+    }
+    return set.size > 0 ? set : null;
+  }, [hoverScope, graphScope, previewFileId, layout.nodes, neighbors, flatFiles]);
+
+  // Preview panel data (same as Graph view).
+  const previewFile =
+    previewFileId && previewFileId !== BRAIN_NODE_ID && !isVaultBrainNodeId(previewFileId)
+      ? flatFiles.find((file) => file.id === previewFileId) || null
+      : null;
+  const previewVault = previewFileId && isVaultBrainNodeId(previewFileId)
+    ? vaults.find((vault) => vault.id === vaultIdFromBrainNodeId(previewFileId)) ?? null
+    : null;
+  const brainMetaFiles = useMemo(() => flatFiles.filter(isBrainMetaFile), [flatFiles]);
+  const brainHomeFiles = useMemo(() => brainMetaFiles.filter(isBrainHomeFile), [brainMetaFiles]);
+
+  if (mdNodes.length === 0 && dbNodes.length === 0) {
+    return (
+      <div className="empty">
+        <div>
+          <h2>No brain to show</h2>
+          <p>Add a brain to populate the 3D view.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`graphCanvas brainCanvas ${focusedIds ? 'is-hovering' : ''} ${previewFileId ? 'has-preview' : ''}`}>
+      <div className="graphModePanel">
+        {(['markdown', 'database', 'hybrid'] as GraphFilterMode[]).map((mode) => (
+          <button key={mode} type="button" className={graphMode === mode ? 'is-active' : ''} onClick={() => setGraphMode(mode)}>
+            {mode}
+          </button>
+        ))}
+        {schemaError && graphMode !== 'markdown' ? (
+          <span className="graphModePanel__error" title={schemaError}>DB layer unavailable</span>
+        ) : null}
+      </div>
+      <BrainView nodes={nodes} edges={edges} focusedIds={focusedIds} onNodeClick={(id) => setGraphPreview(id)} />
+      {previewFile && (
+        <GraphPreviewPanel file={previewFile} onClose={() => setGraphPreview(null)} onOpenEditor={() => onOpenEditor(previewFile.id)} />
+      )}
+      {!previewFile && previewFileId === BRAIN_NODE_ID && (
+        <BrainMapPanel
+          vaults={vaults}
+          files={brainHomeFiles}
+          onClose={() => setGraphPreview(null)}
+          onOpenFile={(fileId) => { setGraphPreview(null); onOpenEditor(fileId); }}
+        />
+      )}
+      {!previewFile && previewVault && (
+        <SubBrainPanel
+          vault={previewVault}
+          homeFile={brainHomeFileMap(brainHomeFiles).get(previewVault.id) ?? null}
+          metaFiles={brainMetaFiles.filter((file) => file.vaultId === previewVault.id)}
+          onClose={() => setGraphPreview(null)}
+          onOpenFile={(fileId) => { setGraphPreview(null); onOpenEditor(fileId); }}
+        />
+      )}
+    </div>
+  );
+}
 
 function GraphView({
   onClearSelections,
   onOpenEditor,
+  colorTick,
 }: {
   onClearSelections: () => void;
   onOpenEditor: (fileId: string) => void;
+  colorTick: number;
 }) {
   const flatFiles = useWikiStore((state) => state.flatFiles);
   const vaults = useWikiStore((state) => state.vaults);
@@ -590,6 +1111,33 @@ function GraphView({
   const [searchQuery, setSearchQuery] = useState('');
   const runSearch = useWikiSearch(flatFiles);
   const rfInstance = useRef<ReactFlowInstance<Node<WikiNodeData>, Edge<WikiEdgeData>> | null>(null);
+
+  // Hybrid graph: markdown documents + the Supabase brain schema (tables, FKs, raw sources).
+  const [graphMode, setGraphMode] = useState<GraphFilterMode>('markdown');
+  const [schemaGraph, setSchemaGraph] = useState<SchemaGraphPayload | null>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (graphMode === 'markdown' || schemaGraph) return;
+    let cancelled = false;
+    fetch('/api/brain/schema-graph')
+      .then((response) => response.json())
+      .then((payload) => {
+        if (cancelled) return;
+        if (payload?.success) {
+          setSchemaGraph(payload as SchemaGraphPayload);
+          setSchemaError(null);
+        } else {
+          setSchemaError(payload?.message || 'Schema graph unavailable. Configure Supabase to enable the database layer.');
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setSchemaError(error instanceof Error ? error.message : 'Schema graph request failed.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [graphMode, schemaGraph]);
 
   const graphInputKey = useMemo(
     () =>
@@ -613,6 +1161,23 @@ function GraphView({
     return computeLayout(graph.nodes, graph.edges);
   }, [graphInputKey]);
 
+  // Schema/DB flow: position each DB raw-source at its related markdown brain node
+  // (matched by sub-brain folder basename / 'brain' for the Big Brain).
+  const schemaFlow = useMemo(() => {
+    if (!schemaGraph) return null;
+    const byOwner = new Map<string, { x: number; y: number }>();
+    for (const [id, n] of layout.nodes) {
+      if (id.startsWith('subbrain:')) {
+        const base = id.slice('subbrain:'.length).split('/').filter(Boolean).pop();
+        if (base) byOwner.set(base, { x: n.x, y: n.y });
+      } else if (n.brain) {
+        byOwner.set('brain', { x: n.x, y: n.y });
+        byOwner.set('master', { x: n.x, y: n.y });
+      }
+    }
+    return buildSchemaFlow(schemaGraph, (ownerId) => (ownerId ? byOwner.get(ownerId) : undefined));
+  }, [schemaGraph, layout]);
+
   const neighbors = useMemo(() => {
     const map = new Map<string, Set<string>>();
     for (const edge of layout.edges) {
@@ -626,10 +1191,16 @@ function GraphView({
 
   const focusedFromNode = useMemo(() => {
     if (!hoverId || !neighbors.has(hoverId)) return null;
+    // Hovering the Big Brain (or the vault root that sits with it) activates the
+    // WHOLE brain — every node + relation lights up.
+    const node = layout.nodes.get(hoverId);
+    if (hoverId === BRAIN_NODE_ID || (node?.subBrain && !hoverId.startsWith('subbrain:'))) {
+      return new Set<string>(layout.nodes.keys());
+    }
     const set = new Set<string>([hoverId]);
     for (const n of neighbors.get(hoverId) || []) set.add(n);
     return set;
-  }, [hoverId, neighbors]);
+  }, [hoverId, neighbors, layout.nodes]);
 
   const nodeIdSet = useMemo(() => new Set(Array.from(layout.nodes.keys())), [layout.nodes]);
   const activeFocusScope = hoverScope ?? (graphScope.type === 'all' ? null : graphScope);
@@ -646,6 +1217,9 @@ function GraphView({
 
     if (activeFocusScope.type === 'vault') {
       const set = new Set<string>();
+      // Whole brain active: the Big Brain root + every sub-brain node + the vault's files.
+      set.add(BRAIN_NODE_ID);
+      for (const id of nodeIdSet) if (id.startsWith('subbrain:')) set.add(id);
       const brainNodeId = `brain:vault:${activeFocusScope.vaultId}`;
       if (nodeIdSet.has(brainNodeId)) set.add(brainNodeId);
       for (const file of flatFiles) {
@@ -664,8 +1238,23 @@ function GraphView({
     return set.size > 0 ? set : null;
   }, [activeFocusScope, flatFiles, neighbors, nodeIdSet]);
 
-  const focusedSet = hoverId ? focusedFromNode : focusedFromScope;
-  const hoverKind: HoverState['hoverKind'] = hoverId ? 'node' : focusedFromScope ? (lockedFocusActive ? 'lock' : 'scope') : null;
+  // When nothing else is focused, the clicked/searched preview node (+ neighbours)
+  // lights up — so a header-search selection glows in the graph just like in the brain.
+  const focusedFromPreview = useMemo(() => {
+    if (!previewFileId || !nodeIdSet.has(previewFileId)) return null;
+    const set = new Set<string>([previewFileId]);
+    for (const n of neighbors.get(previewFileId) || []) set.add(n);
+    return set;
+  }, [previewFileId, nodeIdSet, neighbors]);
+
+  const focusedSet = hoverId ? focusedFromNode : (focusedFromScope ?? focusedFromPreview);
+  const hoverKind: HoverState['hoverKind'] = hoverId
+    ? 'node'
+    : focusedFromScope
+      ? (lockedFocusActive ? 'lock' : 'scope')
+      : focusedFromPreview
+        ? 'scope'
+        : null;
 
   const searchResponse = useMemo(
     () => runSearch({ query: searchQuery, mode: 'agent', limit: 20, includeNeighbors: 1 }),
@@ -709,10 +1298,40 @@ function GraphView({
     return map;
   }, [vaults]);
 
+  // Per-node brain colour: each node inherits the colour of its owning brain
+  // (chosen per-brain colour, keyed by sub-brain folder path / vault id). Used so
+  // edges are drawn in their brain's colour.
+  const nodeBrainColor = useMemo(() => {
+    void colorTick; // recompute when a brain colour changes
+    const stored = getStoredBrainColors();
+    const map = new Map<string, string>();
+    for (const [id, n] of layout.nodes) {
+      if (id.startsWith('subbrain:')) {
+        const path = id.slice('subbrain:'.length);
+        const c = stored[path] ?? (n.vaultId ? vaultColorMap.get(n.vaultId) : undefined);
+        if (c) map.set(id, c);
+      } else if (n.subBrain || n.brain) {
+        const c = (n.vaultId ? stored[n.vaultId] ?? vaultColorMap.get(n.vaultId) : undefined);
+        if (c) map.set(id, c);
+      }
+    }
+    // Files inherit their owning sub-brain's colour via brainAnchor edges.
+    for (const e of layout.edges) {
+      if (e.brainAnchor && e.source.startsWith('subbrain:')) {
+        const c = map.get(e.source);
+        if (c && !map.has(e.target)) map.set(e.target, c);
+      }
+    }
+    return map;
+  }, [layout.nodes, layout.edges, vaultColorMap, colorTick]);
+
   const baseEdges = useMemo<Edge<WikiEdgeData>[]>(() => {
     return layout.edges.map((edge) => {
       const sourceNode = layout.nodes.get(edge.source);
-      const vaultColor = sourceNode?.vaultId ? (vaultColorMap.get(sourceNode.vaultId) ?? undefined) : undefined;
+      const vaultColor =
+        nodeBrainColor.get(edge.source) ??
+        nodeBrainColor.get(edge.target) ??
+        (sourceNode?.vaultId ? (vaultColorMap.get(sourceNode.vaultId) ?? undefined) : undefined);
       return {
         id: edge.id,
         source: edge.source,
@@ -721,20 +1340,35 @@ function GraphView({
         data: { unresolved: edge.unresolved, brainMap: edge.brainMap, brainAnchor: edge.brainAnchor, vaultColor },
       };
     });
-  }, [layout.edges, layout.nodes, vaultColorMap]);
+  }, [layout.edges, layout.nodes, vaultColorMap, nodeBrainColor]);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node<WikiNodeData>>(baseNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge<WikiEdgeData>>(baseEdges);
-  const nextNodesRef = useRef(baseNodes);
-  const nextEdgesRef = useRef(baseEdges);
-  nextNodesRef.current = baseNodes;
-  nextEdgesRef.current = baseEdges;
+  const combinedNodes = useMemo<Node<WikiNodeData>[]>(() => {
+    const dbNodes = (schemaFlow?.nodes ?? []) as unknown as Node<WikiNodeData>[];
+    if (graphMode === 'database') return dbNodes;
+    if (graphMode === 'hybrid') return [...baseNodes, ...dbNodes];
+    return baseNodes;
+  }, [baseNodes, schemaFlow, graphMode]);
+
+  const combinedEdges = useMemo<Edge<WikiEdgeData>[]>(() => {
+    const dbEdges = (schemaFlow?.edges ?? []) as unknown as Edge<WikiEdgeData>[];
+    if (graphMode === 'database') return dbEdges;
+    if (graphMode === 'hybrid') return [...baseEdges, ...dbEdges];
+    return baseEdges;
+  }, [baseEdges, schemaFlow, graphMode]);
+
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node<WikiNodeData>>(combinedNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge<WikiEdgeData>>(combinedEdges);
+  const nextNodesRef = useRef(combinedNodes);
+  const nextEdgesRef = useRef(combinedEdges);
+  nextNodesRef.current = combinedNodes;
+  nextEdgesRef.current = combinedEdges;
 
   const graphKey = useMemo(() => {
     const nodeIds = Array.from(layout.nodes.keys()).sort().join('|');
     const edgeIds = layout.edges.map((edge) => edge.id).sort().join('|');
-    return `${nodeIds}::${edgeIds}`;
-  }, [layout.edges, layout.nodes]);
+    const dbKey = `${graphMode}:${schemaFlow?.nodes.length ?? 0}:${schemaFlow?.edges.length ?? 0}`;
+    return `${nodeIds}::${edgeIds}::${dbKey}`;
+  }, [layout.edges, layout.nodes, graphMode, schemaFlow]);
 
   useEffect(() => {
     setNodes(nextNodesRef.current);
@@ -746,7 +1380,7 @@ function GraphView({
 
   useEffect(() => {
     const id = requestAnimationFrame(() => {
-      rfInstance.current?.fitView({ padding: 0.25 });
+      rfInstance.current?.fitView({ padding: 0.3, maxZoom: 0.9 });
     });
     return () => cancelAnimationFrame(id);
   }, [graphKey]);
@@ -788,12 +1422,29 @@ function GraphView({
           onQueryChange={setSearchQuery}
           onSelect={(id) => setGraphPreview(id)}
         />
+        <div className="graphModePanel">
+          {(['markdown', 'database', 'hybrid'] as GraphFilterMode[]).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              className={graphMode === mode ? 'is-active' : ''}
+              onClick={() => setGraphMode(mode)}
+            >
+              {mode}
+            </button>
+          ))}
+          {schemaError && graphMode !== 'markdown' ? (
+            <span className="graphModePanel__error" title={schemaError}>
+              DB layer unavailable
+            </span>
+          ) : null}
+        </div>
         <ReactFlow
           nodes={nodes}
           edges={edges}
           onInit={(instance) => {
             rfInstance.current = instance;
-            instance.fitView({ padding: 0.25 });
+            instance.fitView({ padding: 0.3, maxZoom: 0.9 });
           }}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
@@ -1388,16 +2039,21 @@ function AddBrainDialog({
   onClose,
   onCreate,
   onJoinCode,
+  brainTargets,
+  onCreateSubBrainUnder,
 }: {
   onClose: () => void;
   onCreate: () => void;
   onJoinCode: (code: string, actorName: string, handle: FileSystemDirectoryHandle) => boolean | Promise<boolean>;
+  brainTargets: { key: string; label: string; folder: WikiFolder }[];
+  onCreateSubBrainUnder: (folder: WikiFolder) => void;
 }) {
   const [code, setCode] = useState('');
   const [actorName, setActorName] = useState('');
   const [joinError, setJoinError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
   const joinPickerBusyRef = useRef(false);
+  const [subBrainTargetKey, setSubBrainTargetKey] = useState('');
 
   return (
     <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
@@ -1480,6 +2136,38 @@ function AddBrainDialog({
               Choose folder
             </button>
           </div>
+
+          {brainTargets.length > 0 && (
+            <div className="addBrainCard">
+              <strong>Sub-Brain</strong>
+              <span>Create a sub-brain under an existing brain.</span>
+              <select
+                value={subBrainTargetKey}
+                onChange={(event) => setSubBrainTargetKey(event.target.value)}
+              >
+                <option value="">Choose a parent brain…</option>
+                {brainTargets.map((t) => (
+                  <option key={t.key} value={t.key}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                className="primary"
+                type="button"
+                disabled={!subBrainTargetKey}
+                onClick={() => {
+                  const target = brainTargets.find((t) => t.key === subBrainTargetKey);
+                  if (!target) return;
+                  onCreateSubBrainUnder(target.folder);
+                  onClose();
+                }}
+              >
+                <Brain size={16} />
+                Create sub-brain
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -1749,6 +2437,34 @@ function LogHistoryPanel({
   );
 }
 
+// Folders that are sources/code/deps, not curated wiki sub-brains. We never promote
+// `{name}-brain.md` anchors found inside these (e.g. raw/ sources, code/ repos and
+// their demo-wikis) to sidebar/graph sub-brains.
+const NON_BRAIN_SUBTREES = new Set([
+  'raw', 'code', 'demo-wikis', 'docs', 'node_modules', '.git', '.next', '.obsidian',
+  'venv', '__pycache__', 'dist', 'build', '.worktrees',
+]);
+
+// A folder is a sub-brain only if it contains its OWN name-matching anchor file
+// (`vision-brain/` → `vision-brain.md`). This avoids false positives like a plan doc
+// `2026-...-la-chaine-brain.md` that merely ends in `-brain.md`.
+function brainAnchorOf(folder: WikiFolder): WikiFile | undefined {
+  const n = folder.name.toLowerCase();
+  const expected = n.endsWith('-brain') ? `${n}.md` : `${n}-brain.md`;
+  return folder.files.find((f) => f.name.toLowerCase() === expected);
+}
+
+// Collect every sub-brain folder, skipping non-curated subtrees (raw/, code/, docs/,
+// demo-wikis, deps).
+function collectBrainAnchorFolders(folder: WikiFolder, out: WikiFolder[] = []): WikiFolder[] {
+  if (brainAnchorOf(folder)) out.push(folder);
+  for (const child of folder.folders) {
+    if (NON_BRAIN_SUBTREES.has(child.name)) continue;
+    collectBrainAnchorFolders(child, out);
+  }
+  return out;
+}
+
 function WikiSidebar({
   vaults,
   activeVaultId,
@@ -1763,8 +2479,12 @@ function WikiSidebar({
   onClearHover,
   onCreateMarkdownInFolder,
   onCreateFolderInFolder,
+  onCreateSubBrainInFolder,
   onSetVaultColor,
+  onSetBrainColor,
+  colorTick,
   onDeleteVault,
+  onDeleteSubBrain,
   canDeleteVault,
 }: {
   vaults: WikiVault[];
@@ -1780,14 +2500,45 @@ function WikiSidebar({
   onClearHover: () => void;
   onCreateMarkdownInFolder: (folder: WikiFolder) => void;
   onCreateFolderInFolder: (folder: WikiFolder) => void;
+  onCreateSubBrainInFolder: (folder: WikiFolder) => void;
   onSetVaultColor: (vaultId: string, color: string | undefined) => void;
+  onSetBrainColor: (key: string, color: string | undefined) => void;
+  colorTick: number;
   onDeleteVault: (vaultId: string) => void;
+  onDeleteSubBrain: (folder: WikiFolder) => void;
   canDeleteVault: (vaultId: string) => boolean;
 }) {
+  // Re-read per-brain colours each render; colorTick changes force a refresh.
+  void colorTick;
+  const storedBrainColors = getStoredBrainColors();
   const [brainFilesOpen, setBrainFilesOpen] = useState(false);
 
   const allFiles = useMemo(() => vaults.flatMap((v) => v.flatFiles), [vaults]);
   const [lintMap, setLintMap] = useState<Map<string, FileLint>>(new Map());
+
+  // Brain sections shown under the BIG BRAIN header. A vault with NO nested
+  // sub-brain folders renders as one brain (the vault = native model / "A"). A vault
+  // WITH nested {name}-brain folders gets each TOP-LEVEL sub-brain promoted to its own
+  // section ("B"); the vault root itself (big-brain config) is not a separate row.
+  const brainSections = useMemo(() => {
+    type Section = { key: string; folder: WikiFolder; vaultId: string; color: string; isVault: boolean };
+    const sections: Section[] = [];
+    for (const vault of vaults) {
+      const color = getVaultColor(vault);
+      const anchors = collectBrainAnchorFolders(vault.tree).filter((f) => f.path !== vault.tree.path);
+      if (anchors.length === 0) {
+        sections.push({ key: vault.id, folder: vault.tree, vaultId: vault.id, color, isVault: true });
+      } else {
+        const topLevel = anchors.filter(
+          (f) => !anchors.some((o) => o.path !== f.path && f.path.startsWith(`${o.path}/`)),
+        );
+        for (const bf of topLevel) {
+          sections.push({ key: bf.id, folder: bf, vaultId: vault.id, color, isVault: false });
+        }
+      }
+    }
+    return sections;
+  }, [vaults]);
 
   useEffect(() => {
     const timeout = window.setTimeout(
@@ -1807,7 +2558,18 @@ function WikiSidebar({
       </div>
       <div className="brainMenu">
         <div className="brainMenuHeader">
-          <button className="wikiBrainHeader" type="button" onClick={onBrain} onMouseEnter={onClearHover}>
+          <button
+            className="wikiBrainHeader"
+            type="button"
+            onClick={onBrain}
+            onMouseEnter={() => {
+              // Hovering BIG BRAIN activates the whole brain (every vault's nodes).
+              const first = vaults[0];
+              if (first) onHoverScope({ type: 'vault', vaultId: first.id });
+              else onClearHover();
+            }}
+            onMouseLeave={onClearHover}
+          >
             Big Brain
           </button>
           <button
@@ -1860,21 +2622,32 @@ function WikiSidebar({
         )}
       </div>
       <div className="wikiList">
-        {vaults.map((vault) => {
-          const color = getVaultColor(vault);
-          const collaborators = collaboratorsForVault(vault.id, memberships, actors);
+        {brainSections.map((section) => {
+          const collaborators = section.isVault
+            ? collaboratorsForVault(section.vaultId, memberships, actors)
+            : [];
           const useInitials = collaborators.length > 5;
+          // Colour key is shared with the graph: folder path for sub-brains, vault id
+          // for vaults — so edge colours can match the chosen brain colour.
+          const colorKey = section.isVault ? section.vaultId : section.folder.path;
+          const color = storedBrainColors[colorKey] ?? section.color;
           return (
             <section
-              className={`wikiSection ${activeVaultId === vault.id ? 'active' : ''}`}
-              key={vault.id}
+              className={`wikiSection ${activeVaultId === section.vaultId ? 'active' : ''}`}
+              key={section.key}
               style={{ '--brain-color': color } as React.CSSProperties}
-              onMouseEnter={() => onHoverScope({ type: 'vault', vaultId: vault.id })}
+              onMouseEnter={() =>
+                section.isVault
+                  ? onHoverScope({ type: 'vault', vaultId: section.vaultId })
+                  : onHoverScope({ type: 'folder', vaultId: section.vaultId, folderPath: section.folder.path })
+              }
               onMouseLeave={onClearHover}
             >
               <FolderNode
-                folder={vault.tree}
+                folder={section.folder}
                 depth={0}
+                asBrain={!section.isVault}
+                isVaultRoot={section.isVault}
                 vaultColor={color}
                 lintMap={lintMap}
                 onFolderCluster={onFolderCluster}
@@ -1882,12 +2655,18 @@ function WikiSidebar({
                 onClearHover={onClearHover}
                 onCreateMarkdownInFolder={onCreateMarkdownInFolder}
                 onCreateFolderInFolder={onCreateFolderInFolder}
-                onSetVaultColor={(c) => onSetVaultColor(vault.id, c)}
-                onDeleteBrain={() => onDeleteVault(vault.id)}
-                canDeleteBrain={canDeleteVault(vault.id)}
+                onCreateSubBrainInFolder={onCreateSubBrainInFolder}
+                onSetVaultColor={(c) => {
+                  if (section.isVault) onSetVaultColor(section.vaultId, c);
+                }}
+                onSetBrainColor={onSetBrainColor}
+                storedBrainColors={storedBrainColors}
+                onDeleteSubBrain={onDeleteSubBrain}
+                onDeleteBrain={section.isVault ? () => onDeleteVault(section.vaultId) : undefined}
+                canDeleteBrain={section.isVault ? canDeleteVault(section.vaultId) : false}
               />
               {collaborators.length > 0 && (
-                <div className="sidebarCollaborators" aria-label={`Collaborators for ${vault.name}`}>
+                <div className="sidebarCollaborators" aria-label="Collaborators">
                   <span className="sidebarCollaboratorsTitle">Collaborators</span>
                   <div className={useInitials ? 'sidebarCollaboratorInitials' : 'sidebarCollaboratorNames'}>
                     {collaborators.map((name) => (
@@ -2105,9 +2884,9 @@ export default function Home() {
     async function restoreStoredVaults() {
       try {
         const storedVaults = await getWikiVaultHandles();
-        // #region agent log
-        fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'pre-fix-3',hypothesisId:'H8',location:'src/app/page.tsx:restoreStoredVaults.afterReadHandles',message:'Stored Brain handles read during restore',data:{storedCount:storedVaults.length,currentVaultCount:useWikiStore.getState().vaults.length,cancelled},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
+        if (cancelled) return;
+        const contentCache = await getVaultContentCache();
+        const cacheById = new Map(contentCache.map((entry) => [entry.id, entry]));
         if (cancelled) return;
 
         const loadedVaults: WikiVault[] = [];
@@ -2117,9 +2896,15 @@ export default function Home() {
             if (await hasVaultPermission(stored.handle, false, 'read')) {
               loadedVaults.push(await loadStoredVault(stored, false));
             } else {
+              // No live permission yet — show the Brain immediately from the durable
+              // content cache (so it's NEVER gone), and queue a silent live upgrade.
+              const cached = cacheById.get(stored.id);
+              if (cached) loadedVaults.push(reconstructVaultFromCache(stored.handle, cached));
               needsReconnect.push(stored);
             }
           } catch {
+            const cached = cacheById.get(stored.id);
+            if (cached) loadedVaults.push(reconstructVaultFromCache(stored.handle, cached));
             needsReconnect.push(stored);
           }
         }
@@ -2130,12 +2915,6 @@ export default function Home() {
             ...currentVaults,
             ...loadedVaults.filter((loaded) => !currentVaults.some((current) => current.id === loaded.id)),
           ];
-          // #region agent log
-          fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'pre-fix-3',hypothesisId:'H8',location:'src/app/page.tsx:restoreStoredVaults.beforeSetVaults',message:'Restore is about to replace store vaults',data:{loadedCount:loadedVaults.length,currentVaultCount:useWikiStore.getState().vaults.length,needsReconnectCount:needsReconnect.length},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
-          // #region agent log
-          fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'post-fix-1',hypothesisId:'H8',location:'src/app/page.tsx:restoreStoredVaults.beforeMergeSetVaults',message:'Restore will merge with current store instead of replacing it',data:{loadedCount:loadedVaults.length,currentVaultCount:currentVaults.length,mergedCount:mergedVaults.length,needsReconnectCount:needsReconnect.length},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
           setVaults(mergedVaults, useWikiStore.getState().activeVaultId ?? loadedVaults[0].id);
         }
         if (!cancelled) {
@@ -2144,9 +2923,6 @@ export default function Home() {
       } catch (err) {
         if (!cancelled) setError((err as Error).message || 'Saved Brains could not be loaded.');
       } finally {
-        // #region agent log
-        fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'pre-fix-3',hypothesisId:'H8',location:'src/app/page.tsx:restoreStoredVaults.finally',message:'Restore finished',data:{cancelled,currentVaultCount:useWikiStore.getState().vaults.length},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         if (!cancelled) setRestoringVault(false);
       }
     }
@@ -2156,6 +2932,14 @@ export default function Home() {
       cancelled = true;
     };
   }, [loadStoredVault, setVaults]);
+
+  // Keep the durable content cache fresh: whenever vaults/their contents change,
+  // snapshot them to IndexedDB so a reload can always rebuild the Brain even if the
+  // browser drops the folder permission. (Best-effort; never blocks the UI.)
+  useEffect(() => {
+    if (vaults.length === 0) return;
+    void saveVaultContentCache(vaults);
+  }, [vaults]);
 
   const openVault = async (options?: { vaultId?: string; vaultName?: string }) => {
     // #region agent log
@@ -2338,6 +3122,20 @@ export default function Home() {
     }
   };
 
+  // Never make the user hunt for a Reconnect button: if the browser dropped the
+  // folder permission on reload, the very first user gesture (any click) silently
+  // re-grants and reloads the saved Brain. (requestPermission requires a user
+  // gesture — a hard browser rule — so one click is the minimum.)
+  useEffect(() => {
+    if (reconnectHandles.length === 0) return;
+    const handler = () => {
+      void reconnectVault();
+    };
+    window.addEventListener('pointerdown', handler, { once: true, capture: true });
+    return () => window.removeEventListener('pointerdown', handler, { capture: true } as EventListenerOptions);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reconnectHandles]);
+
   const forgetSavedBrains = async () => {
     await clearWikiVaultHandles();
     setReconnectHandles([]);
@@ -2494,6 +3292,82 @@ export default function Home() {
     },
     [currentActor.id, memberships, updateVault, vaults],
   );
+
+  const createSubBrainInFolder = useCallback(
+    async (folder: WikiFolder) => {
+      const role = getActorBrainRole(memberships, folder.vaultId, currentActor.id);
+      if (!roleCanEdit(role)) {
+        setError('You do not have permission to create sub-brains in this Brain.');
+        return;
+      }
+      if (!folder.handle) {
+        setError('The selected folder cannot be written to.');
+        return;
+      }
+      const vault = vaults.find((entry) => entry.id === folder.vaultId);
+      if (!vault) return;
+
+      const name = window.prompt('Name of the new Sub-Brain', 'New');
+      if (!name) return;
+      try {
+        if (!(await hasVaultPermission(folder.handle, true))) {
+          setError('Write access to the folder was not granted.');
+          return;
+        }
+        const { folderName, anchorFile } = await createSubBrainInDirectory(folder.handle, name);
+        const { vault: refreshedVault } = await loadVault(vault.rootHandle, vault.id, vault.name);
+        updateVault(refreshedVault);
+        const targetPath = `${folder.path}/${folderName}/${anchorFile}`;
+        const createdAnchor = refreshedVault.flatFiles.find((file) => file.path === targetPath);
+        if (createdAnchor) {
+          selectFile(createdAnchor.id);
+          setActiveVault(vault.id);
+          setGraphReturnFileId(null);
+          setEditorMode('edit');
+        }
+        await saveWikiVaultHandles(useWikiStore.getState().vaults);
+        setError(null);
+      } catch (err) {
+        setError((err as Error).message || 'Sub-Brain could not be created.');
+      }
+    },
+    [currentActor.id, memberships, selectFile, setActiveVault, setEditorMode, updateVault, vaults],
+  );
+
+  const deleteSubBrain = useCallback(
+    async (folder: WikiFolder) => {
+      const role = getActorBrainRole(memberships, folder.vaultId, currentActor.id);
+      if (!roleCanEdit(role)) {
+        setError('You do not have permission to delete sub-brains in this Brain.');
+        return;
+      }
+      const vault = vaults.find((entry) => entry.id === folder.vaultId);
+      if (!vault) return;
+      if (!window.confirm(`Delete the sub-brain "${folder.name}" and everything in it? This cannot be undone.`)) {
+        return;
+      }
+      try {
+        if (!(await hasVaultPermission(vault.rootHandle, true))) {
+          setError('Write access was not granted.');
+          return;
+        }
+        await deleteFolderInVault(vault.rootHandle, folder.path);
+        const { vault: refreshedVault } = await loadVault(vault.rootHandle, vault.id, vault.name);
+        updateVault(refreshedVault);
+        await saveWikiVaultHandles(useWikiStore.getState().vaults);
+        setError(null);
+      } catch (err) {
+        setError((err as Error).message || 'Sub-Brain could not be deleted.');
+      }
+    },
+    [currentActor.id, memberships, updateVault, vaults],
+  );
+
+  const [brainColorTick, setBrainColorTick] = useState(0);
+  const handleSetBrainColor = useCallback((key: string, color: string | undefined) => {
+    setStoredBrainColor(key, color);
+    setBrainColorTick((t) => t + 1);
+  }, []);
 
   const handleSetVaultColor = useCallback(
     async (vaultId: string, color: string | undefined) => {
@@ -2711,6 +3585,7 @@ export default function Home() {
           </div>
         </div>
         <div className="topActions">
+          <HeaderSearch />
           <div className="viewToggle">
             <button className={activeView === 'editor' ? 'active' : ''} onClick={() => setActiveView('editor')}>
               <Pencil size={14} />
@@ -2719,6 +3594,10 @@ export default function Home() {
             <button className={activeView === 'graph' ? 'active' : ''} onClick={() => setActiveView('graph')}>
               <Network size={14} />
               Graph
+            </button>
+            <button className={activeView === 'brain' ? 'active' : ''} onClick={() => setActiveView('brain')}>
+              <Brain size={14} />
+              Brain
             </button>
           </div>
           <button className="ghost" onClick={saveCurrent} disabled={!selectedFile || !selectedFile.dirty || !canEditSelected}>
@@ -2733,6 +3612,13 @@ export default function Home() {
           onClose={() => setAddBrainDialogOpen(false)}
           onCreate={openVault}
           onJoinCode={joinBrainByCode}
+          brainTargets={vaults.flatMap((v) => [
+            { key: v.id, label: v.name, folder: v.tree },
+            ...collectBrainAnchorFolders(v.tree)
+              .filter((f) => f.path !== v.tree.path)
+              .map((f) => ({ key: f.id, label: `↳ ${f.name}`, folder: f })),
+          ])}
+          onCreateSubBrainUnder={createSubBrainInFolder}
         />
       )}
 
@@ -2755,6 +3641,10 @@ export default function Home() {
               onClearHover={clearHoverScope}
               onCreateMarkdownInFolder={createMarkdownInFolder}
               onCreateFolderInFolder={createSubfolder}
+              onCreateSubBrainInFolder={createSubBrainInFolder}
+              colorTick={brainColorTick}
+              onSetBrainColor={handleSetBrainColor}
+              onDeleteSubBrain={deleteSubBrain}
               onSetVaultColor={handleSetVaultColor}
               onDeleteVault={handleDeleteVault}
               canDeleteVault={canDeleteVault}
@@ -2779,8 +3669,10 @@ export default function Home() {
         </aside>
 
         <main className="content">
-          {activeView === 'graph' ? (
-            <GraphView onClearSelections={clearAllSelections} onOpenEditor={openEditorFromGraph} />
+          {activeView === 'brain' ? (
+            <BrainGraph colorTick={brainColorTick} onOpenEditor={openEditorFromGraph} />
+          ) : activeView === 'graph' ? (
+            <GraphView onClearSelections={clearAllSelections} onOpenEditor={openEditorFromGraph} colorTick={brainColorTick} />
           ) : selectedFile && parsed ? (
             <div className="editorLayout">
               <div className="docHeader">
