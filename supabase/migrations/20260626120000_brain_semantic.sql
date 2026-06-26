@@ -1,4 +1,6 @@
 -- ============================================================
+-- NOTE: embedding dim = 768 (Ollama nomic-embed-text, local/free). For OpenAI
+-- text-embedding-3-small use vector(1536) and set BRAIN_EMBEDDING_* env accordingly.
 -- Big Brain semantic search support
 --
 -- Adds pgvector embeddings + full-text search over
@@ -13,7 +15,7 @@ create extension if not exists vector;
 
 -- 2. Embedding column on brain_documents (OpenAI text-embedding-3-small dims)
 alter table public.brain_documents
-  add column if not exists body_embedding vector(1536);
+  add column if not exists body_embedding vector(768);
 
 -- 3. HNSW cosine index for approximate nearest-neighbour search
 create index if not exists brain_documents_body_embedding_hnsw_idx
@@ -32,7 +34,7 @@ create index if not exists brain_documents_fts_idx
 
 -- 5. Vector (semantic) match RPC
 create or replace function public.match_brain_documents(
-  query_embedding vector(1536),
+  query_embedding vector(768),
   p_user_id text,
   p_space_id text,
   match_count int
@@ -131,5 +133,5 @@ $$;
 
 -- 7. Grants for the app service_role (mirror the init migration)
 GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
-GRANT EXECUTE ON FUNCTION public.match_brain_documents(vector(1536), text, text, int) TO service_role;
+GRANT EXECUTE ON FUNCTION public.match_brain_documents(vector(768), text, text, int) TO service_role;
 GRANT EXECUTE ON FUNCTION public.search_brain_documents_lexical(text, text, text, int) TO service_role;
