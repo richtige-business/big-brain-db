@@ -490,15 +490,41 @@ function computeLayout(rawNodes: GraphNode[], rawEdges: GraphEdge[]): {
   >;
   edges: GraphEdge[];
 } {
-  // Radial layout: the Big Brain sits at the centre (0,0); every sub-brain node is
-  // anchored on a ring around it; files cluster around their owning sub-brain. (The
-  // vault node, if any, sits with the Big Brain at the centre.)
-  const subBrainNodes = rawNodes.filter((n) => n.subBrain && n.id.startsWith('subbrain:'));
-  const RING = Math.max(560, subBrainNodes.length * 150);
+  // Hierarchical radial layout: Big Brain at the centre (0,0); top-level sub-brains
+  // on a ring around it; nested sub-brains clustered around their PARENT sub-brain
+  // (recursively); files cluster around their owning sub-brain.
+  const isSub = (id: string) => id.startsWith('subbrain:');
+  // parent -> child sub-brain edges (from brain-map edges, not file anchors)
+  const childrenOf = new Map<string, string[]>();
+  for (const e of rawEdges) {
+    if (!e.brainMap || e.brainAnchor || !isSub(e.target)) continue;
+    const arr = childrenOf.get(e.source) ?? [];
+    if (!arr.includes(e.target)) arr.push(e.target);
+    childrenOf.set(e.source, arr);
+  }
+  // Centre nodes = Big Brain + the vault node(s); their sub-brain children are top-level.
+  const centerIds = new Set(
+    rawNodes.filter((n) => n.brain || (n.subBrain && !isSub(n.id))).map((n) => n.id),
+  );
+  const topLevel: string[] = [];
+  for (const id of centerIds) for (const c of childrenOf.get(id) ?? []) if (!topLevel.includes(c)) topLevel.push(c);
+
   const subBrainCenters = new Map<string, { x: number; y: number }>();
-  subBrainNodes.forEach((n, i) => {
-    const angle = (i / Math.max(subBrainNodes.length, 1)) * Math.PI * 2 - Math.PI / 2;
-    subBrainCenters.set(n.id, { x: Math.cos(angle) * RING, y: Math.sin(angle) * RING });
+  const place = (id: string, pos: { x: number; y: number }, outwardAngle: number, radius: number, span: number) => {
+    subBrainCenters.set(id, pos);
+    const kids = (childrenOf.get(id) ?? []).filter(isSub);
+    if (kids.length === 0) return;
+    const childRadius = Math.max(240, radius * 0.55);
+    kids.forEach((kid, i) => {
+      const a =
+        kids.length === 1 ? outwardAngle : outwardAngle - span / 2 + ((i + 0.5) / kids.length) * span;
+      place(kid, { x: pos.x + Math.cos(a) * childRadius, y: pos.y + Math.sin(a) * childRadius }, a, childRadius, Math.min(span, Math.PI * 0.8));
+    });
+  };
+  const R1 = Math.max(620, topLevel.length * 160);
+  topLevel.forEach((id, i) => {
+    const a = (i / Math.max(topLevel.length, 1)) * Math.PI * 2 - Math.PI / 2;
+    place(id, { x: Math.cos(a) * R1, y: Math.sin(a) * R1 }, a, R1, Math.PI * 0.6);
   });
   const ownerOf = new Map<string, string>();
   for (const e of rawEdges) if (e.brainAnchor) ownerOf.set(e.target, e.source);
