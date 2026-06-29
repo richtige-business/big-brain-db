@@ -12,7 +12,13 @@
 // ============================================================
 
 import { createSupabaseServiceClient } from '@/lib/supabase/server';
-import { LOCAL_USER_ID, getBrainSpaceByScope, type BrainScopeType } from './brain-db';
+import {
+  LOCAL_USER_ID,
+  getBrainSpaceByScope,
+  getBrainDocument,
+  listBrainSpaces,
+  type BrainScopeType,
+} from './brain-db';
 import { embedText } from './embed';
 
 export interface BrainSearchHit {
@@ -218,4 +224,120 @@ export async function hybridSearchBrain(input: {
       lexicalRank: entry.lexicalRank,
       vectorRank: entry.vectorRank,
     }));
+}
+
+export interface BrainContextSource {
+  title: string;
+  slug: string;
+  type: string;
+  brain: string; // human brain name (e.g. "medigen-brain"), or '' if unknown
+}
+
+/** Per-document content cap (chars) when assembling the chat context block.
+ * Generous so overview/anchor docs aren't truncated before they enumerate their
+ * contents (e.g. the products-brain anchor's portfolio list). */
+const CONTEXT_DOC_CHARS = 4000;
+
+/** Drop scaffolding that pollutes RAG: unrendered templates and placeholder docs.
+ * These live under `templates/` and still contain `{{...}}` Handlebars markers. */
+function isNoiseDoc(entry: { slug: string; title: string }): boolean {
+  const slug = entry.slug.toLowerCase();
+  if (slug.includes('templates/') || slug.endsWith('template')) return true;
+  if (/\{\{.*\}\}/.test(entry.title) || !entry.title.trim()) return true;
+  return false;
+}
+
+/**
+ * Build an LLM-ready Brain context block for a natural-language question.
+ *
+ * Unlike buildBrainPromptBlock (literal substring match), this uses the proper
+ * hybrid retrieval (tsvector + pgvector RRF). With no scope it searches EVERY
+ * brain space in ONE global query (p_space_id = null) so scores are globally
+ * comparable; with a scope it searches just that space. The top hits' full content
+ * (capped) goes into the block so the model has real substance, not 200-char
+ * snippets. Returns the block plus structured sources for citation chips.
+ */
+export async function retrieveBrainContext(input: {
+  query: string;
+  limit?: number;
+  scopeType?: BrainScopeType;
+  scopeId?: string;
+}): Promise<{ contextBlock: string; sources: BrainContextSource[] }> {
+  const query = (input.query ?? '').trim();
+  const limit = input.limit ?? DEFAULT_LIMIT;
+  if (!query) return { contextBlock: '', sources: [] };
+
+  // Resolve p_space_id: a specific space's UUID for a scoped ask, else null (all
+  // spaces). The RPCs treat null/'' p_space_id as "search every space".
+  let pSpaceId: string | null = null;
+  if (input.scopeType && input.scopeId) {
+    const space = await getBrainSpaceByScope({
+      userId: LOCAL_USER_ID,
+      scopeType: input.scopeType,
+      scopeId: input.scopeId,
+    });
+    if (!space) return { contextBlock: '', sources: [] };
+    pSpaceId = space.id;
+  }
+
+  const supabase = createSupabaseServiceClient();
+  const matchCount = limit * CANDIDATE_MULTIPLIER;
+  const embedding = await embedText(query);
+
+  const lexicalRows = await safeRpcRows(
+    supabase.rpc('search_brain_documents_lexical', {
+      query_text: query,
+      p_user_id: LOCAL_USER_ID,
+      p_space_id: pSpaceId,
+      match_count: matchCount,
+    }),
+  );
+  const vectorRows = embedding
+    ? await safeRpcRows(
+        supabase.rpc('match_brain_documents', {
+          query_embedding: embedding,
+          p_user_id: LOCAL_USER_ID,
+          p_space_id: pSpaceId,
+          match_count: matchCount,
+        }),
+      )
+    : [];
+
+  const fusion = new Map<string, FusionEntry>();
+  fuseList(fusion, lexicalRows, 'lexical');
+  fuseList(fusion, vectorRows, 'vector');
+  const top = Array.from(fusion.values())
+    .sort((a, b) => b.score - a.score)
+    .filter((entry) => !isNoiseDoc(entry))
+    .slice(0, limit);
+  if (top.length === 0) return { contextBlock: '', sources: [] };
+
+  // Map each document's space UUID → human brain name for citation labels.
+  const spaces = await listBrainSpaces({}).catch(() => []);
+  const brainById = new Map(spaces.map((s) => [s.id, s.scopeId || s.name]));
+
+  // Pull fuller content for each top hit (best-effort; fall back to snippet).
+  const docs = await Promise.all(
+    top.map(async (entry) => {
+      const doc = await getBrainDocument({ id: entry.documentId }).catch(() => null);
+      const body = (doc?.contentMarkdown || buildSnippet(entry.contentMarkdown))
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, CONTEXT_DOC_CHARS);
+      const brain = (doc?.spaceId && brainById.get(doc.spaceId)) || '';
+      return {
+        source: { title: entry.title, slug: entry.slug, type: entry.type, brain },
+        body,
+      };
+    }),
+  );
+
+  const contextBlock = [
+    '# Brain Context (retrieved documents)',
+    'Use this as durable, user-visible knowledge — your primary source of truth.',
+    '',
+    ...docs.map((d) => `## ${d.source.title}  [${d.source.type}${d.source.brain ? ` · ${d.source.brain}` : ''}/${d.source.slug}]\n${d.body}`),
+  ].join('\n');
+
+  return { contextBlock, sources: docs.map((d) => d.source) };
 }

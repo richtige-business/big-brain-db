@@ -120,6 +120,7 @@ import {
 import type { WikiSearchHit } from '@/lib/search';
 import { useWikiSearch } from '@/hooks/useWikiSearch';
 import { PropertiesBlock } from '@/components/PropertiesBlock';
+import { BrainChat } from '@/components/BrainChat';
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false });
 // 3D "brain" view (Three.js) — client-only; heavy, so load on demand.
@@ -3343,7 +3344,7 @@ export default function Home() {
       }
       const vault = vaults.find((entry) => entry.id === folder.vaultId);
       if (!vault) return;
-      if (!window.confirm(`Delete the sub-brain "${folder.name}" and everything in it? This cannot be undone.`)) {
+      if (!window.confirm(`Move the sub-brain "${folder.name}" and everything in it to the Brain trash (.brain-trash)? You can restore it from there.`)) {
         return;
       }
       try {
@@ -3771,6 +3772,7 @@ export default function Home() {
           )}
         </main>
       </div>
+      <BrainChat />
     </div>
   );
 }
