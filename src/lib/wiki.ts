@@ -144,19 +144,60 @@ export const VAULT_PALETTE = [
   '#14b8a6', // teal
 ] as const;
 
-// Delete a (sub-)brain folder from a vault by its full path (which includes the
-// vault root segment). Removes the folder and everything in it.
+// Soft-delete trash folder, kept at the vault root. Starts with '.' so loadVault
+// skips it (HIDDEN handling) — trashed content never reappears as a sub-brain/node.
+export const BRAIN_TRASH_DIR = '.brain-trash';
+
+// Recursively copy a directory's whole subtree into `destParent` under `name`.
+// Used to stage a recoverable copy before any destructive removeEntry.
+async function copyDirectoryInto(
+  source: FileSystemDirectoryHandle,
+  destParent: FileSystemDirectoryHandle,
+  name: string,
+): Promise<FileSystemDirectoryHandle> {
+  const dest = await destParent.getDirectoryHandle(name, { create: true });
+  for (const entry of await directoryEntries(source)) {
+    if (entry.kind === 'directory') {
+      await copyDirectoryInto(entry, dest, entry.name);
+    } else {
+      const file = await entry.getFile();
+      const handle = await dest.getFileHandle(entry.name, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(await file.arrayBuffer());
+      await writable.close();
+    }
+  }
+  return dest;
+}
+
+// "Delete" a (sub-)brain folder by SOFT-DELETING it: the whole subtree is first
+// copied into `.brain-trash/<timestamp>__<name>/` at the vault root, and only then
+// is the original removed. removeEntry is permanent and bypasses the OS trash, so a
+// single bad call could wipe a brain with no recovery — staging a verified copy first
+// guarantees the data is always recoverable (restore = move it back from .brain-trash).
+// folderPath includes the vault root segment.
 export async function deleteFolderInVault(
   rootHandle: FileSystemDirectoryHandle,
   folderPath: string,
 ): Promise<void> {
   const parts = folderPath.split('/').filter(Boolean).slice(1); // drop vault root segment
   if (parts.length === 0) throw new Error('Cannot delete the vault root.');
-  let dir = rootHandle;
+  let parent = rootHandle;
   for (let i = 0; i < parts.length - 1; i += 1) {
-    dir = await dir.getDirectoryHandle(parts[i]);
+    parent = await parent.getDirectoryHandle(parts[i]);
   }
-  await dir.removeEntry(parts[parts.length - 1], { recursive: true });
+  const name = parts[parts.length - 1];
+  const source = await parent.getDirectoryHandle(name);
+
+  // Stage a recoverable copy in the vault's trash. A stamped, name-suffixed folder
+  // avoids collisions when the same brain is deleted more than once.
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const trashRoot = await rootHandle.getDirectoryHandle(BRAIN_TRASH_DIR, { create: true });
+  await copyDirectoryInto(source, trashRoot, `${stamp}__${name}`);
+
+  // Only now that a verified copy exists do we remove the original. If the copy above
+  // threw, we never reach this line and nothing is lost.
+  await parent.removeEntry(name, { recursive: true });
 }
 
 // Per-brain colours, keyed by a brain key (vault id or sub-brain folder path),
