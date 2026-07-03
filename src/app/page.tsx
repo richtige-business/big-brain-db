@@ -121,6 +121,7 @@ import type { WikiSearchHit } from '@/lib/search';
 import { useWikiSearch } from '@/hooks/useWikiSearch';
 import { PropertiesBlock } from '@/components/PropertiesBlock';
 import { BrainChat } from '@/components/BrainChat';
+import type { OnMount } from '@monaco-editor/react';
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false });
 // 3D "brain" view (Three.js) — client-only; heavy, so load on demand.
@@ -1343,12 +1344,25 @@ function GraphView({
     });
   }, [layout.edges, layout.nodes, vaultColorMap, nodeBrainColor]);
 
+  // Tag each markdown node with its (sub-)brain colour so the node can render its
+  // neuron glow + dendrite spikes in that colour.
+  const coloredBaseNodes = useMemo<Node<WikiNodeData>[]>(() => {
+    return baseNodes.map((node) => {
+      const owner = layout.nodes.get(node.id);
+      const color =
+        nodeBrainColor.get(node.id) ??
+        (owner?.vaultId ? vaultColorMap.get(owner.vaultId) : undefined) ??
+        '#9aa0a6';
+      return { ...node, data: { ...node.data, color } };
+    });
+  }, [baseNodes, nodeBrainColor, vaultColorMap, layout.nodes]);
+
   const combinedNodes = useMemo<Node<WikiNodeData>[]>(() => {
     const dbNodes = (schemaFlow?.nodes ?? []) as unknown as Node<WikiNodeData>[];
     if (graphMode === 'database') return dbNodes;
-    if (graphMode === 'hybrid') return [...baseNodes, ...dbNodes];
-    return baseNodes;
-  }, [baseNodes, schemaFlow, graphMode]);
+    if (graphMode === 'hybrid') return [...coloredBaseNodes, ...dbNodes];
+    return coloredBaseNodes;
+  }, [coloredBaseNodes, schemaFlow, graphMode]);
 
   const combinedEdges = useMemo<Edge<WikiEdgeData>[]>(() => {
     const dbEdges = (schemaFlow?.edges ?? []) as unknown as Edge<WikiEdgeData>[];
@@ -1515,11 +1529,19 @@ function WikiNodeView({ id, data }: NodeProps<Node<WikiNodeData>>) {
   const isSubBrain = Boolean(data.subBrain);
 
   const size = data.radius * 2;
+  const nodeColor = (data.color as string) || '#9aa0a6';
   const wrapperStyle = {
     width: NODE_HITBOX,
     height: NODE_HITBOX,
     ['--dot-half' as string]: `${data.radius}px`,
+    ['--node-color' as string]: nodeColor,
   } as React.CSSProperties;
+
+  // Dendrite spikes radiating from the cell body (slightly irregular angles + lengths
+  // for an organic, neuron-like look). Hidden on the Big-Brain / sub-brain hubs.
+  const showDendrites = !isBrain && !isSubBrain && !data.unresolved;
+  const c = NODE_HITBOX / 2;
+  const spikes = [12, 58, 96, 142, 188, 236, 281, 326];
 
   return (
     <div
@@ -1528,6 +1550,24 @@ function WikiNodeView({ id, data }: NodeProps<Node<WikiNodeData>>) {
     >
       <Handle type="target" position={Position.Top} className="graphHandle" isConnectable={false} />
       <Handle type="source" position={Position.Bottom} className="graphHandle" isConnectable={false} />
+      {showDendrites && (
+        <svg className="graphDendrites" width={NODE_HITBOX} height={NODE_HITBOX} aria-hidden>
+          {spikes.map((deg, i) => {
+            const r = (deg * Math.PI) / 180;
+            const inner = data.radius * 0.55;
+            const len = data.radius * (1.4 + ((i % 3) * 0.35)); // varied lengths
+            return (
+              <line
+                key={i}
+                x1={c + Math.cos(r) * inner}
+                y1={c + Math.sin(r) * inner}
+                x2={c + Math.cos(r) * (inner + len)}
+                y2={c + Math.sin(r) * (inner + len)}
+              />
+            );
+          })}
+        </svg>
+      )}
       <div
         className={`graphDot ${data.unresolved ? 'unresolved' : ''} ${isBrain ? 'brain' : ''} ${isSubBrain ? 'subBrain' : ''}`}
         style={{ width: size, height: size }}
@@ -1548,7 +1588,14 @@ function WikiEdgeView({ id, source, target, sourceX, sourceY, targetX, targetY, 
   const searchEdge = !!(ctx.searchMatchSet && (ctx.searchMatchSet.has(source) || ctx.searchMatchSet.has(target)));
   const dim = (ctx.focusedSet !== null && !highlight) || (searchActive && !searchEdge);
 
-  const [edgePath] = getStraightPath({ sourceX, sourceY, targetX, targetY });
+  // Gentle organic arc (quadratic bezier with a perpendicular offset) — a curved
+  // "synapse fibre" instead of a straight line, consistent for any node layout.
+  const mx = (sourceX + targetX) / 2, my = (sourceY + targetY) / 2;
+  const dx = targetX - sourceX, dy = targetY - sourceY;
+  const len = Math.hypot(dx, dy) || 1;
+  const off = Math.min(46, len * 0.16);
+  const cx = mx - (dy / len) * off, cy = my + (dx / len) * off;
+  const edgePath = `M${sourceX},${sourceY} Q${cx},${cy} ${targetX},${targetY}`;
 
   const baseColor = data?.vaultColor ?? 'rgba(15, 23, 42, 1)';
 
@@ -1559,13 +1606,13 @@ function WikiEdgeView({ id, source, target, sourceX, sourceY, targetX, targetY, 
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
   }
 
-  const coloredBase = baseColor.startsWith('#') ? withAlpha(baseColor, 0.18) : 'rgba(15, 23, 42, 0.18)';
-  const coloredHighlight = baseColor.startsWith('#') ? withAlpha(baseColor, 0.58) : 'rgba(15, 23, 42, 0.58)';
-  const coloredSearch = baseColor.startsWith('#') ? withAlpha(baseColor, 0.38) : 'rgba(15, 23, 42, 0.38)';
+  const isHex = baseColor.startsWith('#');
+  const coloredBase = isHex ? withAlpha(baseColor, 0.18) : 'rgba(15, 23, 42, 0.18)';
+  const coloredHighlight = isHex ? withAlpha(baseColor, 0.62) : 'rgba(15, 23, 42, 0.62)';
+  const coloredSearch = isHex ? withAlpha(baseColor, 0.38) : 'rgba(15, 23, 42, 0.38)';
+  const pulseColor = isHex ? baseColor : 'rgba(15, 23, 42, 0.9)';
 
-  let stroke = data?.unresolved
-    ? 'rgba(120, 113, 108, 0.32)'
-    : coloredBase;
+  let stroke = data?.unresolved ? 'rgba(120, 113, 108, 0.32)' : coloredBase;
   let strokeWidth = 1;
   let opacity = 1;
   if (highlight) {
@@ -1577,7 +1624,18 @@ function WikiEdgeView({ id, source, target, sourceX, sourceY, targetX, targetY, 
   }
   if (dim) opacity = 0.14;
 
-  return <BaseEdge id={id} path={edgePath} style={{ stroke, strokeWidth, opacity }} />;
+  return (
+    <>
+      <BaseEdge
+        id={id}
+        path={edgePath}
+        style={{ stroke, strokeWidth, opacity, filter: highlight ? `drop-shadow(0 0 3px ${coloredHighlight})` : undefined }}
+      />
+      {highlight && (
+        <path d={edgePath} className="graphEdgePulse" fill="none" style={{ stroke: pulseColor }} />
+      )}
+    </>
+  );
 }
 
 function GraphSearchPanel({
@@ -1658,19 +1716,21 @@ function GraphPreviewPanel({
         </button>
       </div>
 
-      {previewProperties.length > 0 && (
-        <div className="graphPreviewProperties">
-          {previewProperties.map((prop) => (
-            <div className="graphPreviewProp" key={prop.key}>
-              <span>{prop.key}</span>
-              <strong>{formatPreviewValue(prop.value)}</strong>
-            </div>
-          ))}
-        </div>
-      )}
+      <div className="graphPreviewBody">
+        {previewProperties.length > 0 && (
+          <div className="graphPreviewProperties">
+            {previewProperties.map((prop) => (
+              <div className="graphPreviewProp" key={prop.key}>
+                <span>{prop.key}</span>
+                <strong>{formatPreviewValue(prop.value)}</strong>
+              </div>
+            ))}
+          </div>
+        )}
 
-      <div className="graphPreviewMarkdown markdown">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{parsed.body || '_Empty file._'}</ReactMarkdown>
+        <div className="graphPreviewMarkdown markdown">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{parsed.body || '_Empty file._'}</ReactMarkdown>
+        </div>
       </div>
 
       <div className="graphPreviewActions">
@@ -2736,6 +2796,14 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [supported, setSupported] = useState(true);
   const [reconnectHandles, setReconnectHandles] = useState<StoredWikiVaultHandle[]>([]);
+  // The Monaco editor auto-grows to its content height so the whole document pane
+  // (properties + text) scrolls together instead of the text scrolling on its own.
+  const [editorBodyHeight, setEditorBodyHeight] = useState(480);
+  const handleEditorMount: OnMount = (editor) => {
+    const apply = () => setEditorBodyHeight(Math.max(320, editor.getContentHeight()));
+    editor.onDidContentSizeChange(apply);
+    apply();
+  };
   const [restoringVault, setRestoringVault] = useState(true);
   const [collaborationHydrated, setCollaborationHydrated] = useState(false);
   const [openHeaderPanel, setOpenHeaderPanel] = useState<'collaboration' | 'history' | null>(null);
@@ -3736,14 +3804,20 @@ export default function Home() {
                     <MonacoEditor
                       language="markdown"
                       theme="light"
+                      height={editorBodyHeight}
                       value={parsed.body}
                       onChange={(value) => updateBody(selectedFile.id, value || '')}
+                      onMount={handleEditorMount}
                       options={{
                         readOnly: !canEditSelected,
                         minimap: { enabled: false },
                         wordWrap: 'on',
                         fontSize: 14,
+                        automaticLayout: true,
                         scrollBeyondLastLine: false,
+                        // Auto-grow to content; let the outer doc pane own the scroll
+                        // so properties + text scroll together (no inner scrollbar).
+                        scrollbar: { vertical: 'hidden', alwaysConsumeMouseWheel: false },
                         lineNumbers: 'off',
                         renderLineHighlight: 'none',
                         padding: { top: 16, bottom: 16 },

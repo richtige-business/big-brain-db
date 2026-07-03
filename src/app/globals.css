@@ -1409,8 +1409,8 @@ input.propValue:focus {
 }
 
 .editorPane {
-  flex: 1;
-  min-height: 480px;
+  /* height is driven by Monaco's content size (auto-grow) so the whole doc pane
+     (properties + text) scrolls together via .docBody — no inner editor scroll. */
   padding: 0;
 }
 
@@ -1725,9 +1725,12 @@ input.propValue:focus {
 
 .graphDot {
   border-radius: 50%;
-  background: #44403c;
+  background: var(--node-color, #44403c);
   flex-shrink: 0;
   border: 2px solid transparent;
+  /* soft neuron-cell glow in the node's (sub-)brain colour */
+  filter: drop-shadow(0 0 3px var(--node-color, transparent));
+  transition: filter 0.15s ease;
 }
 
 .graphDot.unresolved {
@@ -1743,6 +1746,56 @@ input.propValue:focus {
 .graphDot.subBrain {
   background: #0f766e;
   border-color: rgba(15, 118, 110, 0.76);
+}
+
+/* Neuron dendrite spikes radiating from each cell (SVG in WikiNodeView). */
+.graphDendrites {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  overflow: visible;
+  pointer-events: none;
+}
+
+.graphDendrites line {
+  stroke: var(--node-color, #9aa0a6);
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  opacity: 0.45;
+  transition: opacity 0.15s ease;
+}
+
+.graphNode.dim .graphDendrites line {
+  opacity: 0.22;
+}
+
+.graphNode.hover .graphDendrites line,
+.graphNode.highlight .graphDendrites line,
+.graphNode.preview .graphDendrites line {
+  opacity: 0.95;
+}
+
+/* Stronger cell glow when the neuron is active. */
+.graphNode.hover .graphDot,
+.graphNode.highlight .graphDot,
+.graphNode.preview .graphDot {
+  filter: drop-shadow(0 0 8px var(--node-color, transparent));
+}
+
+/* Travelling signal pulse along an active synapse fibre. */
+.graphEdgePulse {
+  fill: none;
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-dasharray: 7 1400;
+  pointer-events: none;
+  animation: edgePulse 1.1s linear infinite;
+}
+
+@keyframes edgePulse {
+  from { stroke-dashoffset: 1407; }
+  to { stroke-dashoffset: 0; }
 }
 
 .graphNode.brain .graphLabel {
@@ -1893,6 +1946,13 @@ input.propValue:focus {
   color: var(--text);
 }
 
+/* Single scroll region: properties + markdown scroll together (header/actions stay). */
+.graphPreviewBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .graphPreviewProperties {
   display: grid;
   gap: 4px;
@@ -1922,8 +1982,7 @@ input.propValue:focus {
 }
 
 .graphPreviewMarkdown {
-  flex: 1;
-  overflow-y: auto;
+  /* scroll is owned by .graphPreviewBody so it scrolls with the properties block */
 }
 
 .graphPreviewMarkdown.markdown {
