@@ -2187,9 +2187,6 @@ function AddBrainDialog({
               className="primary"
               type="button"
               onClick={() => {
-                // #region agent log
-                fetch('http://127.0.0.1:7539/ingest/51ee9c2c-12ff-4dbc-8efa-618f72ca3779',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'c84f03'},body:JSON.stringify({sessionId:'c84f03',runId:'pre-fix-1',hypothesisId:'H1',location:'src/app/page.tsx:AddBrainDialog.createButton',message:'Create button pressed inside Add Brain dialog',data:{hasPicker:typeof window!=='undefined'&&typeof window.showDirectoryPicker==='function'},timestamp:Date.now()})}).catch(()=>{});
-                // #endregion
                 onCreate();
               }}
             >

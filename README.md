@@ -19,6 +19,9 @@ The app is designed for three users at once:
 ## Core Features
 
 - Local Markdown vault loading through the browser File System Access API.
+- Three views — Markdown editor, a 2D neuron-network graph, and a 3D anatomical glass brain.
+- In-app **Brain Chat**: RAG-grounded Q&A over your notes via OpenRouter, with a model switcher, editable system prompt, source chips, and a context inspector.
+- Create and (soft-)delete Sub-Brains from the UI, with scaffolded anchor, log, and content folders.
 - Graph view as the default start view.
 - Big Brain root node plus Sub-Brain anchor nodes.
 - Brain metadata files hidden from the graph as separate nodes and shown through Brain panels instead.
@@ -85,6 +88,72 @@ Recommended files:
 
 Avoid folder-level `README.md` files as automatic navigation. Use the Brain file, hub pages, and semantic links instead.
 
+## Creating and Deleting Sub-Brains
+
+A **Sub-Brain** is a brain nested inside another brain: any topic can graduate into its own brain when it grows large enough to own its structure. A folder becomes a sub-brain the moment it contains its own name-matching `<name>-brain.md` anchor, so nesting is recursive — you can create sub-brains of sub-brains.
+
+### Create a sub-brain (two ways in the app)
+
+**A. From the sidebar** — hover a brain/folder row and click the **`New Sub-Brain`** icon button (next to `New Markdown file`). You'll be prompted for a name.
+
+**B. From the `Add Brain` dialog** — open `Add Brain`, use the **`Sub-Brain`** card ("Create a sub-brain under an existing brain."), pick a parent from the **`Choose a parent brain…`** dropdown (nested brains show a `↳` prefix), and click **`Create sub-brain`**.
+
+Either way the app writes, inside a new `<name>-brain` folder:
+
+- **`<name>-brain.md`** — the anchor, with `type: brain`, `tags: [brain, sub-brain]`, a `## Role In The Big Brain` stub (Owns / Does not own / Connects to `[[../<parent>]]` / Entry point), and a `## Navigation Map`.
+- **`log.md`** — seeded with a `setup | <title> sub-brain created` entry.
+- Five standard content subfolders, each with a `.gitkeep`: **`concepts/`, `entities/`, `sources/`, `syntheses/`, `projects/`**.
+
+The new anchor opens in edit mode so you can fill in its role and map. (Sub-brains do not get their own `AGENT_START.md` — that lives once at the vault/brain root.) Creating a sub-brain requires write access to the folder.
+
+### Delete a sub-brain (soft-delete)
+
+Hover the sub-brain row and click the **`Delete sub-brain`** (trash) icon. You'll be asked to confirm: *"Move the sub-brain "&lt;name&gt;" and everything in it to the Brain trash (.brain-trash)? You can restore it from there."*
+
+Deletion is **non-destructive**: the entire subtree is first copied to `.brain-trash/<timestamp>__<name>/` at the vault root, then removed from its original location. Because `.brain-trash` is a hidden dot-folder, its contents never re-appear as graph nodes. To **restore**, move the folder back out of `.brain-trash` manually.
+
+## Views: Editor, Graph, and 3D Brain
+
+The top-right view toggle switches between three views:
+
+- **`Editor`** — the Markdown + frontmatter editor for the selected file. The editor auto-grows to content height so properties and text scroll together.
+- **`Graph`** — the 2D wiki graph, rendered as a **neuron network**: nodes are neuron cell bodies (soma + dendrite spikes) colored by their (sub-)brain, edges are curved synapse fibres, and hovering a node lights it and its neighbours up with a signal pulse travelling the fibres. Layout is radial: the Big Brain sits at the center, top-level sub-brains form a ring, nested sub-brains cluster around their parent, and pages orbit their owning brain. Drag to pan, scroll to zoom.
+- **`Brain`** — a 3D anatomical glass-brain mesh with the same wiki graph rendered *inside* it as an instanced neuron network. Drag to rotate, scroll to zoom, hover a neuron to light up its synapses. Nodes stay dim at rest (no idle auto-firing).
+
+Both graph views share a **`markdown` / `database` / `hybrid`** mode toggle:
+
+- **`markdown`** — the local wiki-link graph only (default).
+- **`database`** — the Supabase brain schema (tables, foreign keys, raw sources). Requires Supabase configured; otherwise shows "Schema graph unavailable. Configure Supabase to enable the database layer."
+- **`hybrid`** — both, merged, behind a faint anatomical brain silhouette.
+
+Selecting a node in one view highlights the same node in the other.
+
+## Brain Chat (Ask the Brain)
+
+Big Brain DB ships an in-app chat assistant that answers questions **grounded in your notes** via retrieval-augmented generation (RAG). It talks to LLMs through [OpenRouter](https://openrouter.ai), so the model key never reaches the browser.
+
+### Setup
+
+Set `OPENROUTER_API_KEY` in `.env.local` (see [Supabase Setup](#supabase-setup) for the full env block). For RAG grounding you also need Supabase running and — for the semantic (vector) half — an embedding key (`OPENAI_API_KEY` or `BRAIN_EMBEDDING_API_KEY`). Without an embedding key, retrieval still works using lexical (full-text) search only. Chat itself only hard-requires `OPENROUTER_API_KEY`; if the database is unreachable the model still answers, just without grounded context.
+
+### Using it
+
+- Click the floating brain launcher (bottom-right, **`Ask the Brain`**) to open the "Glass Chatbar".
+- Type a question (`Message the Brain…`). **Enter** sends, **Shift+Enter** adds a newline. Answers stream token-by-token; grounding **source chips** (`title · brain`) appear from the retrieved documents.
+- **Model switcher** — a searchable dropdown listing OpenRouter's full model catalogue (default `openai/gpt-4o-mini`); your choice persists locally.
+- **Settings** (gear icon):
+  - **System prompt** — editable, with `Reset to default`.
+  - **`Use Brain context (RAG)`** — toggle grounding on/off.
+  - **`Context documents`** — 1–20 slider (how many retrieved docs to feed the model).
+  - **Search scope** — `All brains` (global search across every space) or a single brain space.
+  - **Context inspector** — `Inspect context for current question` shows exactly which documents and text would be retrieved, LLM-free, before you send.
+
+### How retrieval works
+
+`retrieveBrainContext` runs a hybrid search — full-text (tsvector) **and** dense vector (pgvector cosine) — fused with Reciprocal Rank Fusion. With no scope selected it searches every brain space in one global query. Template/scaffold noise is filtered out, and each top document contributes up to ~4000 chars of content to the assembled context block.
+
+Chat API routes: `POST /api/brain/chat` (streaming), `GET /api/brain/models`, `GET /api/brain/spaces`, `POST /api/brain/context` (retrieval preview).
+
 ## Collaboration Model
 
 Big Brain DB currently has a local-first collaboration model with server-ready concepts:
@@ -118,12 +187,33 @@ cp .env.local.example .env.local
 Fill it with your own project values:
 
 ```bash
+# Supabase — powers the database/hybrid graph layers and Brain Chat RAG retrieval
 NEXT_PUBLIC_SUPABASE_URL=<your-supabase-project-url>
 NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-supabase-anon-key>
 SUPABASE_SERVICE_ROLE_KEY=<your-supabase-service-role-key>
+
+# OpenRouter — server-side only; powers Brain Chat (/api/brain/chat)
+OPENROUTER_API_KEY=<your-openrouter-key>
+# Optional: sent as the OpenRouter HTTP-Referer / attribution header
+OPENROUTER_SITE_URL=http://localhost:3000
+
+# Embeddings — enables the dense (pgvector) half of RAG retrieval.
+# Without it, RAG falls back to lexical (full-text) search only.
+OPENAI_API_KEY=<your-openai-key>          # or:
+# BRAIN_EMBEDDING_API_KEY=<embedding-key>
 ```
 
-Never commit `.env.local`. Never commit real Supabase keys. The service role key is server-only and must not be exposed to browsers or public repositories.
+Never commit `.env.local`. Never commit real keys. The service role key and `OPENROUTER_API_KEY` are server-only and must not be exposed to browsers or public repositories. If a key ever leaks, rotate it at the provider immediately.
+
+### Local Supabase in one command
+
+A full local Supabase stack ships with the repo (`supabase/config.toml`, `supabase/migrations/`). If you have the [Supabase CLI](https://supabase.com/docs/guides/cli):
+
+```bash
+supabase start          # boots Postgres + Studio locally, applies migrations
+```
+
+`supabase start` prints the local URL, anon key, and service-role key — paste those three into `.env.local`. Studio runs at `http://localhost:54323`. The database is only needed for the graph `database`/`hybrid` layers and RAG-grounded chat; the app is otherwise fully local-first.
 
 ### Minimal Supabase Tables
 
@@ -482,4 +572,4 @@ Before publishing:
 
 ## License
 
-Add a license before publishing if you want others to reuse the project.
+Released under the [MIT License](LICENSE) — you may use, modify, and redistribute it, including commercially, provided the copyright notice and license text are retained. The software is provided "as is", without warranty.
