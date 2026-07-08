@@ -120,7 +120,6 @@ import {
 import type { WikiSearchHit } from '@/lib/search';
 import { useWikiSearch } from '@/hooks/useWikiSearch';
 import { PropertiesBlock } from '@/components/PropertiesBlock';
-import { BrainChat } from '@/components/BrainChat';
 import type { OnMount } from '@monaco-editor/react';
 
 const MonacoEditor = dynamic(() => import('@monaco-editor/react'), { ssr: false });
@@ -3843,7 +3842,6 @@ export default function Home() {
           )}
         </main>
       </div>
-      <BrainChat />
     </div>
   );
 }

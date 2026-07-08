@@ -128,31 +128,13 @@ Both graph views share a **`markdown` / `database` / `hybrid`** mode toggle:
 
 Selecting a node in one view highlights the same node in the other.
 
-## Brain Chat (Ask the Brain)
+## Talking To Your Brain
 
-Big Brain DB ships an in-app chat assistant that answers questions **grounded in your notes** via retrieval-augmented generation (RAG). It talks to LLMs through [OpenRouter](https://openrouter.ai), so the model key never reaches the browser.
-
-### Setup
-
-Set `OPENROUTER_API_KEY` in `.env.local` (see [Supabase Setup](#supabase-setup) for the full env block). For RAG grounding you also need Supabase running and — for the semantic (vector) half — an embedding key (`OPENAI_API_KEY` or `BRAIN_EMBEDDING_API_KEY`). Without an embedding key, retrieval still works using lexical (full-text) search only. Chat itself only hard-requires `OPENROUTER_API_KEY`; if the database is unreachable the model still answers, just without grounded context.
-
-### Using it
-
-- Click the floating brain launcher (bottom-right, **`Ask the Brain`**) to open the "Glass Chatbar".
-- Type a question (`Message the Brain…`). **Enter** sends, **Shift+Enter** adds a newline. Answers stream token-by-token; grounding **source chips** (`title · brain`) appear from the retrieved documents.
-- **Model switcher** — a searchable dropdown listing OpenRouter's full model catalogue (default `openai/gpt-4o-mini`); your choice persists locally.
-- **Settings** (gear icon):
-  - **System prompt** — editable, with `Reset to default`.
-  - **`Use Brain context (RAG)`** — toggle grounding on/off.
-  - **`Context documents`** — 1–20 slider (how many retrieved docs to feed the model).
-  - **Search scope** — `All brains` (global search across every space) or a single brain space.
-  - **Context inspector** — `Inspect context for current question` shows exactly which documents and text would be retrieved, LLM-free, before you send.
-
-### How retrieval works
-
-`retrieveBrainContext` runs a hybrid search — full-text (tsvector) **and** dense vector (pgvector cosine) — fused with Reciprocal Rank Fusion. With no scope selected it searches every brain space in one global query. Template/scaffold noise is filtered out, and each top document contributes up to ~4000 chars of content to the assembled context block.
-
-Chat API routes: `POST /api/brain/chat` (streaming), `GET /api/brain/models`, `GET /api/brain/spaces`, `POST /api/brain/context` (retrieval preview).
+Big Brain DB does not ship its own in-app chat assistant. Brain interaction is
+meant to happen through **external coding agents** (Claude Code, Cursor, and
+other MCP clients) via the [MCP Server](#mcp-server) below — point an agent at
+your vault and ask it questions directly; it reads, searches, and edits notes
+through the same MCP tools a human would use the app for.
 
 ## Collaboration Model
 
@@ -187,23 +169,19 @@ cp .env.local.example .env.local
 Fill it with your own project values:
 
 ```bash
-# Supabase — powers the database/hybrid graph layers and Brain Chat RAG retrieval
+# Supabase — powers the database/hybrid graph layers, sharing, and search
 NEXT_PUBLIC_SUPABASE_URL=<your-supabase-project-url>
 NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-supabase-anon-key>
 SUPABASE_SERVICE_ROLE_KEY=<your-supabase-service-role-key>
 
-# OpenRouter — server-side only; powers Brain Chat (/api/brain/chat)
-OPENROUTER_API_KEY=<your-openrouter-key>
-# Optional: sent as the OpenRouter HTTP-Referer / attribution header
-OPENROUTER_SITE_URL=http://localhost:3000
-
-# Embeddings — enables the dense (pgvector) half of RAG retrieval.
-# Without it, RAG falls back to lexical (full-text) search only.
+# Embeddings — optional, enables the dense (pgvector) half of /api/brain/search.
+# Without it, that search falls back to lexical (full-text) only. Not required
+# for any core feature — Brain interaction is via MCP-connected coding agents.
 OPENAI_API_KEY=<your-openai-key>          # or:
 # BRAIN_EMBEDDING_API_KEY=<embedding-key>
 ```
 
-Never commit `.env.local`. Never commit real keys. The service role key and `OPENROUTER_API_KEY` are server-only and must not be exposed to browsers or public repositories. If a key ever leaks, rotate it at the provider immediately.
+Never commit `.env.local`. Never commit real keys. The service role key is server-only and must not be exposed to browsers or public repositories. If a key ever leaks, rotate it at the provider immediately.
 
 ### Local Supabase in one command
 
@@ -213,7 +191,7 @@ A full local Supabase stack ships with the repo (`supabase/config.toml`, `supaba
 supabase start          # boots Postgres + Studio locally, applies migrations
 ```
 
-`supabase start` prints the local URL, anon key, and service-role key — paste those three into `.env.local`. Studio runs at `http://localhost:54323`. The database is only needed for the graph `database`/`hybrid` layers and RAG-grounded chat; the app is otherwise fully local-first.
+`supabase start` prints the local URL, anon key, and service-role key — paste those three into `.env.local`. Studio runs at `http://localhost:54323`. The database is only needed for the graph `database`/`hybrid` layers, collaboration/sharing, and search; the app is otherwise fully local-first.
 
 ### Minimal Supabase Tables
 
